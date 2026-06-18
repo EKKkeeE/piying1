@@ -1,11 +1,9 @@
 import {
   clamp,
   gravityHangDeg,
-  smooth,
   smoothAngle,
   smoothAngleExp,
   smoothExp,
-  smoothPoint,
   smoothPointExp,
 } from "./utils.js";
 import { landmarkToStage } from "./stageCoords.js";
@@ -34,11 +32,6 @@ const CHAIN_CHILD_PARTS = new Set([
 
 const FINGER_ZONE = { xMin: 0.04, xMax: 0.96, yMin: 0.08, yMax: 0.92 };
 const LINE_HEAD_ID = "line_head";
-/** 中指（MP 空间）：静止强抑抖，一旦在动就跟手 */
-const HEAD_MP_STILL = 0.05;
-const HEAD_MP_MOVE = 0.88;
-
-/** MediaPipe 归一化坐标差 → 舞台像素偏移 */
 function mpDeltaToStage(dmx, dmy, stageRect, mirrorX = true) {
   const xSpan = (FINGER_ZONE.xMax - FINGER_ZONE.xMin) * stageRect.width;
   const ySpan = (FINGER_ZONE.yMax - FINGER_ZONE.yMin) * stageRect.height;
@@ -50,6 +43,15 @@ function mpDeltaToStage(dmx, dmy, stageRect, mirrorX = true) {
 
 function mpMoveToStagePx(dmp, stageRect) {
   return dmp * (FINGER_ZONE.xMax - FINGER_ZONE.xMin) * stageRect.width;
+}
+
+/** 小于阈值则保持上一帧，滤除 MediaPipe 静止噪声 */
+function stabilizeStagePoint(prev, next, thresholdPx) {
+  if (!prev) return { x: next.x, y: next.y };
+  if (Math.hypot(next.x - prev.x, next.y - prev.y) <= thresholdPx) {
+    return { x: prev.x, y: prev.y };
+  }
+  return { x: next.x, y: next.y };
 }
 
 /**
@@ -97,21 +99,19 @@ const GRAVITY_PART_SPECS = [
   { name: "shin_l", pivot: "knee", distal: "ankle", min: -65, max: 65 },
   { name: "shin_r", pivot: "knee", distal: "ankle", min: -65, max: 65 },
 ];
-const STILL_MOVE_PX = 12;
+const STILL_MOVE_PX = 14;
 const STILL_HOLD_MS = 160;
-const ACTIVE_MOVE_PX = 18;
-const BURST_MOVE_PX = 32;
-const FINGER_NOISE_PX = 6;
-const LOCAL_MP_STILL = 0.04;
-const LOCAL_MP_MOVE = 0.78;
+const ACTIVE_MOVE_PX = 22;
+const BURST_MOVE_PX = 36;
+const FINGER_NOISE_PX = 5;
+/** 非提线指节（掌指关节等）显示 deadzone */
+const SKELETON_JOINT_NOISE_PX = 4;
 /** 平移停下后锁定四肢 IK 时长（ms） */
 const SETTLE_HOLD_MS = 90;
 /** 舞台 px/s：高于此视为正在平移 */
-const TRANSLATE_VEL_ENTER = 140;
+const TRANSLATE_VEL_ENTER = 120;
 /** 低于此且曾在平移 → 进入 settle */
-const TRANSLATE_VEL_EXIT = 48;
-const MP_BLEND_SMOOTH = 0.38;
-const DISPLAY_SNAP_PX = 2.5;
+const TRANSLATE_VEL_EXIT = 40;
 /** 四肢响应参数更快渐变，避免肘膝跟手迟滞 */
 const LIMB_RESPONSE_BLEND_KEYS = new Set([
   "limbSpeed",
@@ -146,7 +146,8 @@ const BINDING_RESPONSE_GAIN = {
 const TORSO_SOLVE_MIN = -52;
 const TORSO_SOLVE_MAX = 52;
 const TORSO_GRAVITY_BIAS = 0.28;
-const TORSO_TORQUE_GAIN = 0.092;
+const TORSO_TORQUE_GAIN = 0.055;
+const TORSO_TORQUE_GAIN_MOVE = 0.092;
 /** 提线拴在子段时，对应躯干上的受力枢轴（肩/髋） */
 const CHAIN_TORSO_MOUNT = {
   lower_arm_l: "shoulder_l",
@@ -154,14 +155,22 @@ const CHAIN_TORSO_MOUNT = {
   shin_l: "hip_l",
   shin_r: "hip_r",
 };
-/** 肩/肘/髋关节额外响应倍率（越大跟手越快、单帧转角越大） */
+/** 肩/肘/髋额外响应倍率（仅在快速运动时放大） */
 const JOINT_SENSITIVITY = {
-  upper_arm_l: { speed: 2.35, maxDelta: 2.15 },
-  upper_arm_r: { speed: 2.35, maxDelta: 2.15 },
-  lower_arm_l: { speed: 2.1, maxDelta: 2.0 },
-  lower_arm_r: { speed: 2.1, maxDelta: 2.0 },
-  thigh_l: { speed: 2.35, maxDelta: 2.15 },
-  thigh_r: { speed: 2.35, maxDelta: 2.15 },
+  upper_arm_l: { speed: 1.45, maxDelta: 1.35 },
+  upper_arm_r: { speed: 1.45, maxDelta: 1.35 },
+  lower_arm_l: { speed: 1.35, maxDelta: 1.3 },
+  lower_arm_r: { speed: 1.35, maxDelta: 1.3 },
+  thigh_l: { speed: 1.45, maxDelta: 1.35 },
+  thigh_r: { speed: 1.45, maxDelta: 1.35 },
+};
+const JOINT_SENSITIVITY_BURST = {
+  upper_arm_l: { speed: 2.1, maxDelta: 1.85 },
+  upper_arm_r: { speed: 2.1, maxDelta: 1.85 },
+  lower_arm_l: { speed: 1.9, maxDelta: 1.75 },
+  lower_arm_r: { speed: 1.9, maxDelta: 1.75 },
+  thigh_l: { speed: 2.1, maxDelta: 1.85 },
+  thigh_r: { speed: 2.1, maxDelta: 1.85 },
 };
 /** 二连杆 IK：父段（肩/髋）连续性权重，越低越灵敏 */
 const PARENT_CHAIN_CONTINUITY = 0.32;
@@ -204,35 +213,32 @@ export class FingerMarionette {
     this.root = { x: 0, y: 0, rotation: 0 };
     this.handStill = false;
     this._stillMs = 0;
-    this._prevFingerStage = new Map();
-    /** @type {Map<string, number>} */
-    this._prevFingerTime = new Map();
+    /** @type {{ x: number, y: number } | null} 上一帧检测到的原始中指 MP 坐标 */
+    this._prevRawMiddleMp = null;
+    /** @type {Map<string, { x: number, y: number }>} 上一帧原始相对中指偏移（MP） */
+    this._prevRawRelMp = new Map();
+    /** @type {Map<string, { x: number, y: number }>} 上一帧检测目标（舞台像素） */
+    this._prevTargetStage = new Map();
+    /** @type {{ x: number, y: number } | null} */
+    this._prevPalmStage = null;
     /** @type {{ x: number, y: number } | null} */
     this._palmStage = null;
-    /** @type {{ x: number, y: number } | null} */
-    this._smoothHeadFinger = null;
-    /** @type {Map<string, { x: number, y: number }>} */
-    this._smoothFingerTips = new Map();
-    /** @type {Map<string, { x: number, y: number }>} 60fps 显示用插值指尖 */
+    /** @type {Map<number, { x: number, y: number }>} 稳定后的骨架结点（舞台像素） */
+    this._skeletonStage = new Map();
+    /** @type {Map<string, { x: number, y: number }>} 60fps 显示插值指尖（唯一平滑层） */
     this._displayFingers = new Map();
-    /** @type {{ x: number, y: number } | null} 平滑后的中指 MediaPipe 坐标 */
-    this._smoothMiddleMp = null;
-    /** @type {Map<string, { x: number, y: number }>} 相对中指的 MP 偏移 */
-    this._smoothMpLocal = new Map();
-    /** @type {number} 平滑后的掌心/中指平移速度（舞台 px/s） */
+    /** @type {number} 平滑后的掌心平移速度（舞台 px/s） */
     this._smoothPalmVel = 0;
-    /** @type {boolean} 是否处于快速平移段 */
+    /** @type {boolean} 是否处于整手平移段 */
     this._translating = false;
     /** @type {number} settle 结束时间戳 */
     this._settleUntil = 0;
     /** @type {Map<string, { x: number, y: number }>} 停下瞬间锁定的四肢 IK 目标 */
     this._lockedLimbIkAsm = new Map();
-    /** @type {number} MP 平滑系数渐变 0=静止 1=运动 */
-    this._mpMotionBlend = 0;
-    this._lastStillCheckAt = 0;
-    /** @type {Record<string, number> | null} 运动响应参数渐变，避免模式切换突变 */
+    this._lastDetectAt = 0;
+    /** @type {Record<string, number> | null} 运动响应参数渐变 */
     this._blendedResponse = null;
-    /** @type {boolean} 本帧是否直跟指尖（跳过 display 滞后层） */
+    /** @type {boolean} 本帧直跟（仅 burst） */
     this._moveDirect = false;
     this._initLimbs(rigData);
     this._initGravityLimbs(rigData);
@@ -513,11 +519,9 @@ export class FingerMarionette {
     return now < this._settleUntil;
   }
 
-  /** 移动中直跟：跳过 display/root 二次滤波，消除相对位移假抖 */
-  _shouldMoveDirect(motion, palmVel, settling, handStill) {
-    if (settling || handStill) return false;
-    // 仅在明确的整手平移状态下直跟，避免慢速平移被噪声频繁触发。
-    return this._translating && palmVel > TRANSLATE_VEL_EXIT;
+  _shouldMoveDirect(motion, palmVel, settling) {
+    if (settling) return false;
+    return palmVel > 180 || motion > BURST_MOVE_PX;
   }
 
   /** 运动响应参数渐变，避免 default↔active↔burst 硬切 */
@@ -535,8 +539,19 @@ export class FingerMarionette {
     return out;
   }
 
-  _mpAlpha(still, move, blend) {
-    return still + (move - still) * clamp(blend, 0, 1);
+  /** @param {string} partName */
+  _jointGain(partName, palmVel, maxMovePx) {
+    const burst = palmVel > 180 || maxMovePx > BURST_MOVE_PX;
+    const table = burst ? JOINT_SENSITIVITY_BURST : JOINT_SENSITIVITY;
+    return table[partName] ?? { speed: 1, maxDelta: 1 };
+  }
+
+  _displayStage(bindingId) {
+    return (
+      this._displayFingers.get(bindingId) ??
+      this._fingerAssembly.get(bindingId)?.fingerStage ??
+      null
+    );
   }
 
   /** 由舞台指尖/中指坐标算装配 IK 目标（与 display 无关） */
@@ -549,21 +564,16 @@ export class FingerMarionette {
   }
 
   _snapshotLimbIkFromTargets(layout, headBinding) {
-    const middle = this._fingerAssembly.get(LINE_HEAD_ID)?.fingerStage;
+    const middle = this._displayStage(LINE_HEAD_ID);
     if (!middle || !headBinding) return;
     this._lockedLimbIkAsm.clear();
     for (const binding of this.bindings) {
       if (binding.id === LINE_HEAD_ID) continue;
-      const fd = this._fingerAssembly.get(binding.id);
-      if (!fd) continue;
+      const fdStage = this._displayStage(binding.id);
+      if (!fdStage) continue;
       this._lockedLimbIkAsm.set(
         binding.id,
-        this._fingerAsmFromStages(
-          fd.fingerStage,
-          middle,
-          layout,
-          headBinding
-        )
+        this._fingerAsmFromStages(fdStage, middle, layout, headBinding)
       );
     }
   }
@@ -588,7 +598,7 @@ export class FingerMarionette {
   }
 
   /** 移动越快响应越快；settle 时锁 IK、统一 display 收敛 */
-  _motionResponse(maxMovePx, handStill = false, settling = false, palmVel = 0) {
+  _motionResponse(maxMovePx, settling = false, palmVel = 0) {
     if (settling) {
       return {
         rootSpeed: 14,
@@ -600,24 +610,6 @@ export class FingerMarionette {
         torsoMaxDelta: 10,
         limbMaxDelta: 14,
         limbChildMaxDelta: 18,
-        reachBoost: 0,
-        slackScale: 1,
-        chainContinuity: 0.22,
-        chainSearchDeg: 28,
-        chainChildContinuity: 0.45,
-      };
-    }
-    if (handStill) {
-      return {
-        rootSpeed: 7,
-        torsoSpeed: 8,
-        limbSpeed: 10,
-        limbChildSpeed: 12,
-        fingerSpeed: 6,
-        limbFingerSpeed: 6,
-        torsoMaxDelta: 10,
-        limbMaxDelta: 12,
-        limbChildMaxDelta: 14,
         reachBoost: 0,
         slackScale: 1,
         chainContinuity: 0.22,
@@ -683,30 +675,26 @@ export class FingerMarionette {
     };
   }
 
-  /** 移动时直跟指尖；静止/settle 时插值收敛，避免相对位移假抖 */
-  _tickDisplayFingers(dt, response, settling = false, moveDirect = false) {
-    const unified = settling || moveDirect ? response.fingerSpeed : null;
+  /** 检测帧目标 → 显示帧插值（唯一空间平滑层） */
+  _tickDisplayFingers(dt, response, moveDirect = false) {
     for (const binding of this.bindings) {
       const target = this._fingerAssembly.get(binding.id);
       if (!target) continue;
+      const tgt = target.fingerStage;
       let next;
       if (moveDirect) {
-        next = { x: target.fingerStage.x, y: target.fingerStage.y };
+        next = { x: tgt.x, y: tgt.y };
       } else {
-        const prev =
-          this._displayFingers.get(binding.id) ?? target.fingerStage;
+        const prev = this._displayFingers.get(binding.id) ?? tgt;
         const speed =
-          unified ??
-          (binding.id === LINE_HEAD_ID
+          binding.id === LINE_HEAD_ID
             ? response.fingerSpeed
-            : response.limbFingerSpeed);
-        next = smoothPointExp(prev, target.fingerStage, speed, dt);
-        if (settling) {
-          const dx = next.x - target.fingerStage.x;
-          const dy = next.y - target.fingerStage.y;
-          if (Math.hypot(dx, dy) < DISPLAY_SNAP_PX) {
-            next = { x: target.fingerStage.x, y: target.fingerStage.y };
-          }
+            : response.limbFingerSpeed;
+        next = smoothPointExp(prev, tgt, speed, dt);
+        const dx = next.x - tgt.x;
+        const dy = next.y - tgt.y;
+        if (Math.hypot(dx, dy) < FINGER_NOISE_PX) {
+          next = { x: tgt.x, y: tgt.y };
         }
       }
       this._displayFingers.set(binding.id, next);
@@ -751,20 +739,16 @@ export class FingerMarionette {
       return this._lockedLimbIkAsm.get(bindingId);
     }
 
-    const midAsm = this._fingerAssembly.get(LINE_HEAD_ID)?.fingerStage;
-    const fdAsm = this._fingerAssembly.get(bindingId);
-    if (midAsm && fdAsm && bindingId !== LINE_HEAD_ID) {
-      return this._fingerAsmFromStages(
-        fdAsm.fingerStage,
-        midAsm,
-        layout,
-        headBinding
-      );
+    const midStage = this._displayStage(LINE_HEAD_ID);
+    const fdStage = this._displayStage(bindingId);
+    if (midStage && fdStage && bindingId !== LINE_HEAD_ID) {
+      return this._fingerAsmFromStages(fdStage, midStage, layout, headBinding);
     }
 
-    const fd = this._fingerAssembly.get(bindingId);
-    if (!fd) return { x: layout.ax, y: layout.ay };
-    return layout.stageToAssembly(fd.fingerStage, this.root.x, this.root.y);
+    if (fdStage) {
+      return layout.stageToAssembly(fdStage, this.root.x, this.root.y);
+    }
+    return { x: layout.ax, y: layout.ay };
   }
 
   _syncRootToRig(rig) {
@@ -808,23 +792,35 @@ export class FingerMarionette {
     if (controlIdx < 0 || !landmarks[controlIdx]) {
       return { landmarks: [], connections: HAND_CONNECTIONS };
     }
+    return this._buildStableHandSkeleton(landmarks[controlIdx], stageRect);
+  }
 
-    const handLm = landmarks[controlIdx];
+  /** 21 点骨架：检测帧 deadzone，避免静止时指节结点抖动 */
+  _buildStableHandSkeleton(handLm, stageRect) {
     const out = [];
     for (let i = 0; i < handLm.length; i++) {
       const lm = handLm[i];
       if (!lm) continue;
-      const pt = landmarkToStage(stageRect, lm, this.mirrorX, FINGER_ZONE);
+      const raw = landmarkToStage(stageRect, lm, this.mirrorX, FINGER_ZONE);
+      const prev = this._skeletonStage.get(i);
+      const threshold = TIP_INDICES.includes(i)
+        ? FINGER_NOISE_PX
+        : SKELETON_JOINT_NOISE_PX;
+      const stable = stabilizeStagePoint(prev, raw, threshold);
+      this._skeletonStage.set(i, stable);
       out.push({
         index: i,
-        x: pt.x,
-        y: pt.y,
+        x: stable.x,
+        y: stable.y,
         isTip: TIP_INDICES.includes(i),
       });
     }
     return { landmarks: out, connections: HAND_CONNECTIONS };
   }
 
+  /**
+   * 仅在 fresh 检测帧调用：写入原始目标坐标与运动状态，不做空间平滑。
+   */
   updateFromHand(result, layout) {
     layout.refresh(true);
     const stageRect = layout.stageRect;
@@ -838,10 +834,21 @@ export class FingerMarionette {
 
     let maxFingerMove = 0;
     let palmMove = 0;
+    const now = performance.now();
+    const detectDt = this._lastDetectAt
+      ? Math.max(0.012, (now - this._lastDetectAt) / 1000)
+      : 1 / 24;
+    this._lastDetectAt = now;
 
     const controlIdx = this._findHandIndex("left", handedness);
+    let handLm = null;
+    let midLm = null;
+    let headStageRaw = null;
+
     if (controlIdx >= 0 && landmarks[controlIdx]) {
-      const handLm = landmarks[controlIdx];
+      handLm = landmarks[controlIdx];
+      midLm = handLm[12] ?? handLm[9] ?? null;
+
       const palm = this._palmLandmark(handLm);
       const palmLm = palm ?? handLm[9] ?? handLm[0];
       if (palmLm) {
@@ -860,151 +867,110 @@ export class FingerMarionette {
         this._prevPalmStage = { x: palmStage.x, y: palmStage.y };
         this._palmStage = { x: palmStage.x, y: palmStage.y };
       }
+
+      if (midLm) {
+        const prevRawMid = this._prevRawMiddleMp;
+        if (prevRawMid) {
+          const midMoveMp = Math.hypot(
+            midLm.x - prevRawMid.x,
+            midLm.y - prevRawMid.y
+          );
+          maxFingerMove = Math.max(
+            maxFingerMove,
+            mpMoveToStagePx(midMoveMp, stageRect)
+          );
+        }
+        this._prevRawMiddleMp = { x: midLm.x, y: midLm.y };
+        headStageRaw = landmarkToStage(
+          stageRect,
+          midLm,
+          this.mirrorX,
+          FINGER_ZONE
+        );
+        headStageRaw = stabilizeStagePoint(
+          this._prevTargetStage.get(LINE_HEAD_ID),
+          headStageRaw,
+          FINGER_NOISE_PX
+        );
+      }
     } else {
       this._palmStage = null;
     }
 
-    const now = performance.now();
-    let handLm = null;
-    let midLm = null;
+    if (handLm && midLm && headStageRaw) {
+      for (const binding of this.bindings) {
+        const hi = this._findHandIndex(binding.hand, handedness);
+        if (hi < 0 || !landmarks[hi]) continue;
 
-    if (controlIdx >= 0 && landmarks[controlIdx]) {
-      handLm = landmarks[controlIdx];
-      midLm = handLm[12] ?? handLm[9] ?? null;
-      if (midLm) {
-        const prevMidMp = this._smoothMiddleMp;
-        const midMoveMp = prevMidMp
-          ? Math.hypot(midLm.x - prevMidMp.x, midLm.y - prevMidMp.y)
+        const tipIdx = FINGERTIPS[binding.finger] ?? 8;
+        const tipLm = handLm[tipIdx];
+        if (!tipLm) continue;
+
+        let rawStage;
+        if (binding.id === LINE_HEAD_ID) {
+          rawStage = { x: headStageRaw.x, y: headStageRaw.y };
+        } else {
+          const rawRelMp = {
+            x: tipLm.x - midLm.x,
+            y: tipLm.y - midLm.y,
+          };
+          const prevRawRel = this._prevRawRelMp.get(binding.id);
+          if (prevRawRel) {
+            const localMoveMp = Math.hypot(
+              rawRelMp.x - prevRawRel.x,
+              rawRelMp.y - prevRawRel.y
+            );
+            maxFingerMove = Math.max(
+              maxFingerMove,
+              mpMoveToStagePx(localMoveMp, stageRect)
+            );
+          }
+          this._prevRawRelMp.set(binding.id, {
+            x: rawRelMp.x,
+            y: rawRelMp.y,
+          });
+          const offset = mpDeltaToStage(
+            rawRelMp.x,
+            rawRelMp.y,
+            stageRect,
+            this.mirrorX
+          );
+          rawStage = {
+            x: headStageRaw.x + offset.x,
+            y: headStageRaw.y + offset.y,
+          };
+        }
+
+        const prevTarget = this._prevTargetStage.get(binding.id);
+        const rawMovePx = prevTarget
+          ? Math.hypot(rawStage.x - prevTarget.x, rawStage.y - prevTarget.y)
           : 0;
-        const midMoveStage = mpMoveToStagePx(midMoveMp, stageRect);
-        maxFingerMove = Math.max(maxFingerMove, midMoveStage);
-
-        const headAlpha = this._mpAlpha(
-          HEAD_MP_STILL,
-          HEAD_MP_MOVE,
-          this._mpMotionBlend
+        const fingerStage = stabilizeStagePoint(
+          prevTarget,
+          rawStage,
+          FINGER_NOISE_PX
         );
-        this._smoothMiddleMp = smoothPoint(
-          this._smoothMiddleMp ?? midLm,
-          midLm,
-          headAlpha
-        );
-        this._smoothHeadFinger = landmarkToStage(
-          stageRect,
-          this._smoothMiddleMp,
-          this.mirrorX,
-          FINGER_ZONE
-        );
-      }
-    }
-
-    for (const binding of this.bindings) {
-      const hi = this._findHandIndex(binding.hand, handedness);
-      if (hi < 0 || !landmarks[hi] || !handLm || !midLm || !this._smoothHeadFinger) {
-        continue;
-      }
-
-      const tip = landmarks[hi][FINGERTIPS[binding.finger] ?? 8];
-      if (!tip) continue;
-
-      let fingerStage;
-      let movePx = 0;
-
-      if (binding.id === LINE_HEAD_ID) {
-        fingerStage = { ...this._smoothHeadFinger };
-        const prev = this._prevFingerStage.get(binding.id);
-        movePx = prev
-          ? Math.hypot(fingerStage.x - prev.x, fingerStage.y - prev.y)
-          : 0;
-      } else {
-        const tipLm = handLm[FINGERTIPS[binding.finger] ?? 8] ?? tip;
-        const anchorMp = this._smoothMiddleMp ?? midLm;
-        const rawRelMp = {
-          x: tipLm.x - anchorMp.x,
-          y: tipLm.y - anchorMp.y,
-        };
-        const prevRelMp = this._smoothMpLocal.get(binding.id);
-        const localMoveMp = prevRelMp
-          ? Math.hypot(rawRelMp.x - prevRelMp.x, rawRelMp.y - prevRelMp.y)
-          : 0;
-        const localMoveStage = mpMoveToStagePx(localMoveMp, stageRect);
-        maxFingerMove = Math.max(maxFingerMove, localMoveStage);
-        movePx = localMoveStage;
-
-        const localAlpha = this._mpAlpha(
-          LOCAL_MP_STILL,
-          LOCAL_MP_MOVE,
-          this._mpMotionBlend
-        );
-        const smoothRelMp = smoothPoint(
-          prevRelMp ?? rawRelMp,
-          rawRelMp,
-          localAlpha
-        );
-        this._smoothMpLocal.set(binding.id, smoothRelMp);
-        const offset = mpDeltaToStage(
-          smoothRelMp.x,
-          smoothRelMp.y,
-          stageRect,
-          this.mirrorX
-        );
-        fingerStage = {
-          x: this._smoothHeadFinger.x + offset.x,
-          y: this._smoothHeadFinger.y + offset.y,
-        };
-      }
-
-      let vx = 0;
-      let vy = 0;
-      const prev = this._prevFingerStage.get(binding.id);
-      const prevTime = this._prevFingerTime.get(binding.id) ?? now;
-      const dtSec = Math.max(0.012, (now - prevTime) / 1000);
-      if (prev) {
-        vx = (fingerStage.x - prev.x) / dtSec;
-        vy = (fingerStage.y - prev.y) / dtSec;
-      }
-      if (movePx < FINGER_NOISE_PX) {
-        vx = 0;
-        vy = 0;
-      }
-
-      this._prevFingerStage.set(binding.id, {
-        x: fingerStage.x,
-        y: fingerStage.y,
-      });
-      this._prevFingerTime.set(binding.id, now);
-      this._fingerAssembly.set(binding.id, { fingerStage, movePx, vx, vy });
-
-      if (!this._displayFingers.has(binding.id)) {
-        this._displayFingers.set(binding.id, {
+        const movePx =
+          rawMovePx <= FINGER_NOISE_PX && prevTarget ? 0 : rawMovePx;
+        this._prevTargetStage.set(binding.id, {
           x: fingerStage.x,
           y: fingerStage.y,
         });
+        this._fingerAssembly.set(binding.id, { fingerStage, movePx });
+
+        if (!this._displayFingers.has(binding.id)) {
+          this._displayFingers.set(binding.id, {
+            x: fingerStage.x,
+            y: fingerStage.y,
+          });
+        }
       }
     }
 
     const moved =
       maxFingerMove > STILL_MOVE_PX || palmMove > STILL_MOVE_PX;
-    const since = now - (this._lastStillCheckAt || now);
-    this._lastStillCheckAt = now;
 
-    const motionTarget =
-      maxFingerMove > STILL_MOVE_PX || palmMove > STILL_MOVE_PX ? 1 : 0;
-    if (palmMove > ACTIVE_MOVE_PX || maxFingerMove > ACTIVE_MOVE_PX) {
-      this._mpMotionBlend = Math.max(this._mpMotionBlend, 0.9);
-    } else {
-      this._mpMotionBlend = smooth(
-        this._mpMotionBlend,
-        motionTarget,
-        MP_BLEND_SMOOTH
-      );
-    }
-
-    this._updateTranslateSettle(now, Math.max(0, palmMove), since, layout);
-
-    if (this._translating) {
-      this._mpMotionBlend = 1;
-    }
+    this._updateTranslateSettle(now, palmMove, detectDt * 1000, layout);
 
     if (this.handStill) {
       if (maxFingerMove > ACTIVE_MOVE_PX || palmMove > ACTIVE_MOVE_PX) {
@@ -1014,15 +980,17 @@ export class FingerMarionette {
     } else if (moved) {
       this._stillMs = 0;
     } else if (this.hasAnyFinger) {
-      this._stillMs += since;
+      this._stillMs += detectDt * 1000;
       this.handStill = this._stillMs >= STILL_HOLD_MS;
     }
 
     if (this.handStill) {
-      for (const fd of this._fingerAssembly.values()) {
-        fd.vx = 0;
-        fd.vy = 0;
+      for (const [id, fd] of this._fingerAssembly.entries()) {
         fd.movePx = 0;
+        this._displayFingers.set(id, {
+          x: fd.fingerStage.x,
+          y: fd.fingerStage.y,
+        });
       }
     }
 
@@ -1030,26 +998,27 @@ export class FingerMarionette {
       this.lastFingerNodes = fingerNodes;
       this.lastHandSkeleton = this.collectHandSkeleton(result, stageRect);
     } else {
-      this._prevFingerStage.clear();
-      this._prevFingerTime.clear();
-      this._prevPalmStage = null;
-      this._palmStage = null;
-      this._smoothHeadFinger = null;
-      this._smoothMiddleMp = null;
-      this._smoothFingerTips.clear();
-      this._smoothMpLocal.clear();
-      this._displayFingers.clear();
-      this._smoothPalmVel = 0;
-      this._translating = false;
-      this._settleUntil = 0;
-      this._lockedLimbIkAsm.clear();
-      this._mpMotionBlend = 0;
-      this._lastStillCheckAt = 0;
-      this._blendedResponse = null;
-      this._moveDirect = false;
-      this._stillMs = 0;
-      this.handStill = false;
+      this._resetHandTracking();
     }
+  }
+
+  _resetHandTracking() {
+    this._prevTargetStage.clear();
+    this._prevRawRelMp.clear();
+    this._prevRawMiddleMp = null;
+    this._prevPalmStage = null;
+    this._palmStage = null;
+    this._displayFingers.clear();
+    this._skeletonStage.clear();
+    this._smoothPalmVel = 0;
+    this._translating = false;
+    this._settleUntil = 0;
+    this._lockedLimbIkAsm.clear();
+    this._lastDetectAt = 0;
+    this._blendedResponse = null;
+    this._moveDirect = false;
+    this._stillMs = 0;
+    this.handStill = false;
   }
 
   _palmLandmark(handLm) {
@@ -1140,7 +1109,10 @@ export class FingerMarionette {
     Object.assign(rig.displayRotations, saved);
 
     const hang = this._torsoHangAngle(torsoLimb);
-    const pullDeg = clamp(torque * TORSO_TORQUE_GAIN, -42, 42);
+    const torqueGain = this._translating
+      ? TORSO_TORQUE_GAIN_MOVE
+      : TORSO_TORQUE_GAIN;
+    const pullDeg = clamp(torque * torqueGain, -42, 42);
     return clamp(
       hang * TORSO_GRAVITY_BIAS + pullDeg,
       TORSO_SOLVE_MIN,
@@ -1148,7 +1120,7 @@ export class FingerMarionette {
     );
   }
 
-  _solveLimbBindings(rig, layout, bonesOut, dt, response, handStill, headBinding) {
+  _solveLimbBindings(rig, layout, bonesOut, dt, response, headBinding) {
     /** @type {Record<string, number>} */
     const targets = {};
 
@@ -1222,6 +1194,7 @@ export class FingerMarionette {
   }
 
   _applyLimbSolveTargets(bonesOut, response, dt, targets) {
+    const maxMove = this._maxFingerMotion();
     for (const [name, target] of Object.entries(targets)) {
       const limb = this.limbs.get(name);
       if (!limb) continue;
@@ -1237,9 +1210,9 @@ export class FingerMarionette {
       const maxDelta = isChild
         ? (response.limbChildMaxDelta ?? response.limbMaxDelta * 1.35)
         : response.limbMaxDelta;
-      const jointGain = JOINT_SENSITIVITY[name];
-      const effSpeed = speed * (jointGain?.speed ?? 1);
-      const effMaxDelta = maxDelta * (jointGain?.maxDelta ?? 1);
+      const jointGain = this._jointGain(name, this._smoothPalmVel, maxMove);
+      const effSpeed = speed * jointGain.speed;
+      const effMaxDelta = maxDelta * jointGain.maxDelta;
       limb.angle = smoothAngleExp(
         limb.angle,
         target,
@@ -1264,25 +1237,18 @@ export class FingerMarionette {
       const moveDirect = this._shouldMoveDirect(
         motion,
         this._smoothPalmVel,
-        settling,
-        this.handStill
+        settling
       );
       this._moveDirect = moveDirect;
       const response = this._blendMotionResponse(
-        this._motionResponse(
-          motion,
-          this.handStill,
-          settling,
-          this._smoothPalmVel
-        ),
+        this._motionResponse(motion, settling, this._smoothPalmVel),
         dt
       );
 
-      this._tickDisplayFingers(dt, response, settling, moveDirect);
+      this._tickDisplayFingers(dt, response, moveDirect);
 
-      const headStage = moveDirect
-        ? headFinger.fingerStage
-        : this._displayFingers.get(LINE_HEAD_ID);
+      const headStage =
+        this._displayFingers.get(LINE_HEAD_ID) ?? headFinger.fingerStage;
       if (headStage) {
         this._placeRootFromFinger(
           layout,
@@ -1321,7 +1287,6 @@ export class FingerMarionette {
         bonesOut,
         dt,
         response,
-        this.handStill,
         headBinding
       );
     } else {
@@ -1374,7 +1339,7 @@ export class FingerMarionette {
       }
     }
 
-    this._applyGravityChain(rig, layout, bonesOut, this.physicsActive && !this.handStill);
+    this._applyGravityChain(rig, layout, bonesOut, this.physicsActive);
 
     rig.syncDisplayRotations(bonesOut);
 

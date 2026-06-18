@@ -240,10 +240,9 @@ function loop(ts) {
 
   if (handLandmarker && handDetector && fingerCtrl && playerRig && layoutCache) {
     const handTick = handDetector.tick(handLandmarker, ts);
-    if (handTick?.result) {
-      // 每帧都喂缓存结果，让控制层在渲染帧率下连续收敛，避免仅 fresh 帧跳变。
+    if (handTick?.fresh) {
       fingerCtrl.updateFromHand(handTick.result, layoutCache);
-      if (DEBUG && handTick.fresh) drawDebugHands(handTick.result);
+      if (DEBUG) drawDebugHands(handTick.result);
     }
 
     if (!lastPose) {

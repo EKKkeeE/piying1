@@ -1,8 +1,9 @@
-/** 手部检测：低分辨率画布 + 与主循环对齐的 60fps 推理 */
+/** 手部检测：低分辨率画布 + 限帧推理（输入层低通，渲染层在 step 插值） */
 
 export const DETECT_WIDTH = 320;
 export const DETECT_HEIGHT = 240;
-export const TARGET_DETECT_FPS = 60;
+/** 检测帧率：不必跟显示器同频，24fps 足够跟手且显著降低 landmark 噪声 */
+export const TARGET_DETECT_FPS = 24;
 /** @deprecated 与 TARGET_DETECT_FPS 相同，保留兼容 import */
 export const DEFAULT_DETECT_FPS = TARGET_DETECT_FPS;
 /** @deprecated 与 TARGET_DETECT_FPS 相同，保留兼容 import */

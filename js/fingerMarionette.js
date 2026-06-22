@@ -45,13 +45,24 @@ function mpMoveToStagePx(dmp, stageRect) {
   return dmp * (FINGER_ZONE.xMax - FINGER_ZONE.xMin) * stageRect.width;
 }
 
-/** 小于阈值则保持上一帧，滤除 MediaPipe 静止噪声 */
+/**
+ * 摩擦死区滤波：死区内完全锁住，超出死区时只移动超出的那部分距离。
+ * 相比硬切死区（直接跳到 next），消除了"蓄积-突跳"效应：
+ * 缓慢移动时坐标平滑蠕动，而非周期性阶跃；随机噪声因方向随机无法蓄积。
+ */
 function stabilizeStagePoint(prev, next, thresholdPx) {
   if (!prev) return { x: next.x, y: next.y };
-  if (Math.hypot(next.x - prev.x, next.y - prev.y) <= thresholdPx) {
+  const dx = next.x - prev.x;
+  const dy = next.y - prev.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= thresholdPx) {
     return { x: prev.x, y: prev.y };
   }
-  return { x: next.x, y: next.y };
+  const ratio = (dist - thresholdPx) / dist;
+  return {
+    x: prev.x + dx * ratio,
+    y: prev.y + dy * ratio,
+  };
 }
 
 /**
@@ -212,6 +223,7 @@ export class FingerMarionette {
     this._fingerAssembly = new Map();
     this.root = { x: 0, y: 0, rotation: 0 };
     this.handStill = false;
+    this._wasHandStill = false;
     this._stillMs = 0;
     /** @type {{ x: number, y: number } | null} 上一帧检测到的原始中指 MP 坐标 */
     this._prevRawMiddleMp = null;
@@ -985,14 +997,20 @@ export class FingerMarionette {
     }
 
     if (this.handStill) {
+      const justEnteredStill = !this._wasHandStill;
       for (const [id, fd] of this._fingerAssembly.entries()) {
         fd.movePx = 0;
-        this._displayFingers.set(id, {
-          x: fd.fingerStage.x,
-          y: fd.fingerStage.y,
-        });
+        if (justEnteredStill) {
+          // 仅在第一次进入静止状态时锁定一次，之后不再覆写。
+          // 持续覆写会把 fingerStage 的噪声跳变直接传入 IK，造成抖动。
+          this._displayFingers.set(id, {
+            x: fd.fingerStage.x,
+            y: fd.fingerStage.y,
+          });
+        }
       }
     }
+    this._wasHandStill = this.handStill;
 
     if (this.hasAnyFinger) {
       this.lastFingerNodes = fingerNodes;
@@ -1019,6 +1037,7 @@ export class FingerMarionette {
     this._moveDirect = false;
     this._stillMs = 0;
     this.handStill = false;
+    this._wasHandStill = false;
   }
 
   _palmLandmark(handLm) {

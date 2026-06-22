@@ -159,9 +159,13 @@ const TORSO_SOLVE_MAX = 52;
 const TORSO_GRAVITY_BIAS = 0.28;
 const TORSO_TORQUE_GAIN = 0.15;
 const TORSO_TORQUE_GAIN_MOVE = 0.25;
-// 单肢扭矩贡献钳位：防止极紧绷弦（手靠近摄像头）使第一项 d(sinθ·pullMag)/dA 线性增大，
-// 突破正反馈稳定阈值 dT/dA < 1 导致振荡。被钳位后 d(clamped)/dA = 0，增益降至 0。
+// 单肢扭矩贡献钳位（上限）：防止单肢主导造成过大倾斜。
 const TORSO_LIMB_CONTRIB_CLAMP = 150;
+// 躯干专用指尖平滑速度：独立平滑层，不受 moveDirect 绕过影响。
+// 比耶、OK 等手势中折叠/接触指尖的 MediaPipe 噪声经 1/scale=3.125 放大后，
+// 会在 moveDirect 模式下直注入躯干扭矩，造成目标角剧烈振荡。
+// 以 speed=8 再次平滑，将帧间噪声幅度压缩约 3-4 倍，从根本上消除此抖动源。
+const TORSO_FINGER_SMOOTH_SPEED = 8;
 /** 提线拴在子段时，对应躯干上的受力枢轴（肩/髋） */
 const CHAIN_TORSO_MOUNT = {
   lower_arm_l: "shoulder_l",
@@ -242,6 +246,8 @@ export class FingerMarionette {
     this._skeletonStage = new Map();
     /** @type {Map<string, { x: number, y: number }>} 60fps 显示插值指尖（唯一平滑层） */
     this._displayFingers = new Map();
+    /** @type {Map<string, { x: number, y: number }>} 躯干扭矩专用平滑指尖（speed=8，始终平滑，不受 moveDirect 影响） */
+    this._torsoDisplayFingers = new Map();
     /** @type {number} 平滑后的掌心平移速度（舞台 px/s） */
     this._smoothPalmVel = 0;
     /** @type {boolean} 是否处于整手平移段 */
@@ -578,6 +584,26 @@ export class FingerMarionette {
     };
   }
 
+  /**
+   * 躯干扭矩专用的装配空间指尖坐标：使用 _torsoDisplayFingers（始终平滑，不受
+   * moveDirect 绕过影响），消除折叠/接触手指的高频噪声对躯干扭矩的注入。
+   */
+  _fingerAsmForTorso(layout, bindingId, headBinding) {
+    const midStage =
+      this._torsoDisplayFingers.get(LINE_HEAD_ID) ??
+      this._fingerAssembly.get(LINE_HEAD_ID)?.fingerStage;
+    const fdStage =
+      this._torsoDisplayFingers.get(bindingId) ??
+      this._fingerAssembly.get(bindingId)?.fingerStage;
+    if (midStage && fdStage) {
+      return this._fingerAsmFromStages(fdStage, midStage, layout, headBinding);
+    }
+    if (fdStage) {
+      return layout.stageToAssembly(fdStage, this.root.x, this.root.y);
+    }
+    return { x: layout.ax, y: layout.ay };
+  }
+
   _snapshotLimbIkFromTargets(layout, headBinding) {
     const middle = this._displayStage(LINE_HEAD_ID);
     if (!middle || !headBinding) return;
@@ -716,6 +742,26 @@ export class FingerMarionette {
         }
       }
       this._displayFingers.set(binding.id, next);
+    }
+  }
+
+  /**
+   * 躯干扭矩专用指尖平滑更新。
+   * 始终以 TORSO_FINGER_SMOOTH_SPEED 跟踪 _displayFingers（而非 fingerStage），
+   * 因此 moveDirect 模式下 _displayFingers 的突变会被再次平滑，
+   * 消除折叠/接触手指（比耶的无名指/小指、OK 的食指拇指）噪声对躯干的影响。
+   */
+  _tickTorsoFingers(dt) {
+    for (const binding of this.bindings) {
+      const display = this._displayFingers.get(binding.id);
+      if (!display) continue;
+      const prev = this._torsoDisplayFingers.get(binding.id);
+      if (!prev) {
+        this._torsoDisplayFingers.set(binding.id, { x: display.x, y: display.y });
+        continue;
+      }
+      const next = smoothPointExp(prev, display, TORSO_FINGER_SMOOTH_SPEED, dt);
+      this._torsoDisplayFingers.set(binding.id, next);
     }
   }
 
@@ -1033,6 +1079,7 @@ export class FingerMarionette {
     this._prevPalmStage = null;
     this._palmStage = null;
     this._displayFingers.clear();
+    this._torsoDisplayFingers.clear();
     this._skeletonStage.clear();
     this._smoothPalmVel = 0;
     this._translating = false;
@@ -1096,13 +1143,14 @@ export class FingerMarionette {
     if (!head) return this._torsoHangAngle(torsoLimb);
 
     const saved = { ...rig.displayRotations };
-    // 使用当前角（而非固定的0）计算肩/髋挂载点，保留自然平衡机制：
-    // 当躯干倾斜时肩/髋随之旋转，改变弦的松紧，提供恢复力找到平衡角。
-    // 原来直接用 torsoLimb.angle 导致反馈增益 |dT/dA| ≈ 73 >> 4.87（振荡临界），
-    // 原因是力矩单位为 asm²（力 × 力臂），数值高达 1~5 万，pullDeg 永远饱和到 ±42°，
-    // 且梯度极大。修复方法：将力矩除以力臂长度 r（单位化为 asm），使增益降至 ≈ 0.39，
-    // 远低于临界值，同时 pullDeg 不再饱和，躯干可响应手势的实际不对称程度。
-    rig.displayRotations.torso = torsoLimb.angle;
+    // 使用固定参考角 0°（而非当前角 torsoLimb.angle）计算肩/髋挂载点，
+    // 从根本上打断"当前角 → 挂载位 → 弦力矩 → 新目标角"的正反馈循环。
+    // 分析表明：对于比耶（食指与中指等高）、OK（无名指/小指竖直伸展）等手势，
+    // 弦方向与躯干旋转方向对齐，导致 dT/dA > 0（正反馈），极端情形下 dT/dA > 1 发散。
+    // 固定参考角使 dT/dA = 0，彻底保证在所有手势下稳定收敛。
+    // 配合归一化力矩（÷r）和独立平滑的 _torsoDisplayFingers，
+    // pullDeg 可连续响应手势不对称程度，不再饱和，也不受 moveDirect 噪声注入影响。
+    rig.displayRotations.torso = 0;
     let torque = 0;
 
     for (const binding of this.bindings) {
@@ -1112,7 +1160,7 @@ export class FingerMarionette {
       const limb = this.limbs.get(binding.part);
       if (!limb) continue;
 
-      const fingerAsm = this._fingerAsmForIk(layout, binding.id, headBinding);
+      const fingerAsm = this._fingerAsmForTorso(layout, binding.id, headBinding);
       const mountKey = CHAIN_TORSO_MOUNT[binding.part];
       if (!mountKey) continue;
       const mount = rig.getJointAssemblyByKey("torso", mountKey);
@@ -1300,6 +1348,7 @@ export class FingerMarionette {
       );
 
       this._tickDisplayFingers(dt, response, moveDirect);
+      this._tickTorsoFingers(dt);
 
       const headStage =
         this._displayFingers.get(LINE_HEAD_ID) ?? headFinger.fingerStage;

@@ -159,6 +159,9 @@ const TORSO_SOLVE_MAX = 52;
 const TORSO_GRAVITY_BIAS = 0.28;
 const TORSO_TORQUE_GAIN = 0.15;
 const TORSO_TORQUE_GAIN_MOVE = 0.25;
+// 单肢扭矩贡献钳位：防止极紧绷弦（手靠近摄像头）使第一项 d(sinθ·pullMag)/dA 线性增大，
+// 突破正反馈稳定阈值 dT/dA < 1 导致振荡。被钳位后 d(clamped)/dA = 0，增益降至 0。
+const TORSO_LIMB_CONTRIB_CLAMP = 150;
 /** 提线拴在子段时，对应躯干上的受力枢轴（肩/髋） */
 const CHAIN_TORSO_MOUNT = {
   lower_arm_l: "shoulder_l",
@@ -1131,11 +1134,18 @@ export class FingerMarionette {
 
       const rx = mount.x - head[0];
       const ry = mount.y - head[1];
-      // 除以力臂长度 r，将力矩从 asm²（高达万量级）归一化为 asm 量级，
-      // 避免 pullDeg 永远饱和，同时将反馈增益 dT/dA 从 ~73 降到 ~0.39。
+      // 除以力臂长度 r 归一化（asm² → asm 量级），消除弦长导致的数量级差异。
+      // 再对单肢贡献钳位至 ±TORSO_LIMB_CONTRIB_CLAMP：
+      //   • 弦松紧适中（|contrib| < 150）：保持原始值，负反馈 dT/dA ≈ -0.47，平滑收敛。
+      //   • 弦极紧（手靠近摄像头，|contrib| ≥ 150）：钳位为常数，d(clamped)/dA = 0，
+      //     完全消除正反馈增益，稳定性从 dT/dA ≈ +1.2（不稳定）降至 0（完全稳定）。
       const r = Math.hypot(rx, ry);
       if (r < 0.001) continue;
-      torque += (rx * pullY - ry * pullX) / r;
+      const contrib = (rx * pullY - ry * pullX) / r;
+      torque += Math.max(
+        -TORSO_LIMB_CONTRIB_CLAMP,
+        Math.min(TORSO_LIMB_CONTRIB_CLAMP, contrib)
+      );
     }
 
     Object.assign(rig.displayRotations, saved);

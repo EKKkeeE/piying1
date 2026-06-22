@@ -157,8 +157,8 @@ const BINDING_RESPONSE_GAIN = {
 const TORSO_SOLVE_MIN = -52;
 const TORSO_SOLVE_MAX = 52;
 const TORSO_GRAVITY_BIAS = 0.28;
-const TORSO_TORQUE_GAIN = 0.055;
-const TORSO_TORQUE_GAIN_MOVE = 0.092;
+const TORSO_TORQUE_GAIN = 0.15;
+const TORSO_TORQUE_GAIN_MOVE = 0.25;
 /** 提线拴在子段时，对应躯干上的受力枢轴（肩/髋） */
 const CHAIN_TORSO_MOUNT = {
   lower_arm_l: "shoulder_l",
@@ -1093,13 +1093,13 @@ export class FingerMarionette {
     if (!head) return this._torsoHangAngle(torsoLimb);
 
     const saved = { ...rig.displayRotations };
-    // 使用中性角(0)计算肩/髋挂载点，而非 torsoLimb.angle。
-    // 原因：torsoLimb.angle 会通过 getJointAssemblyByKey 影响肩髋坐标，
-    // 进而影响力矩与目标角，形成 angle→mount→torque→target→angle 的反馈环路。
-    // 当反馈增益 |dT/dA| > 2/k-1 ≈ 4.87 时，离散更新产生周期-2 振荡
-    //（每步在两个角度之间来回跳跃），即观察到的躯干剧烈抖动。
-    // 使用固定参考角(0)使 T(A) 与 A 无关，彻底消除此反馈。
-    rig.displayRotations.torso = 0;
+    // 使用当前角（而非固定的0）计算肩/髋挂载点，保留自然平衡机制：
+    // 当躯干倾斜时肩/髋随之旋转，改变弦的松紧，提供恢复力找到平衡角。
+    // 原来直接用 torsoLimb.angle 导致反馈增益 |dT/dA| ≈ 73 >> 4.87（振荡临界），
+    // 原因是力矩单位为 asm²（力 × 力臂），数值高达 1~5 万，pullDeg 永远饱和到 ±42°，
+    // 且梯度极大。修复方法：将力矩除以力臂长度 r（单位化为 asm），使增益降至 ≈ 0.39，
+    // 远低于临界值，同时 pullDeg 不再饱和，躯干可响应手势的实际不对称程度。
+    rig.displayRotations.torso = torsoLimb.angle;
     let torque = 0;
 
     for (const binding of this.bindings) {
@@ -1131,7 +1131,11 @@ export class FingerMarionette {
 
       const rx = mount.x - head[0];
       const ry = mount.y - head[1];
-      torque += rx * pullY - ry * pullX;
+      // 除以力臂长度 r，将力矩从 asm²（高达万量级）归一化为 asm 量级，
+      // 避免 pullDeg 永远饱和，同时将反馈增益 dT/dA 从 ~73 降到 ~0.39。
+      const r = Math.hypot(rx, ry);
+      if (r < 0.001) continue;
+      torque += (rx * pullY - ry * pullX) / r;
     }
 
     Object.assign(rig.displayRotations, saved);

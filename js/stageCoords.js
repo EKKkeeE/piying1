@@ -2,6 +2,14 @@
  * 将摄像头手势坐标映射到皮影背景场景（非摄像头画面）内。
  */
 
+/** 阶段1牵线绑定：与阶段2手部映射一致，便于骨架与凹槽对齐 */
+export const BINDING_ZONE = {
+  xMin: 0.04,
+  xMax: 0.96,
+  yMin: 0.08,
+  yMax: 0.92,
+};
+
 /**
  * @param {DOMRect} stageRect
  * @param {{ x: number, y: number }} lm MediaPipe 归一化坐标

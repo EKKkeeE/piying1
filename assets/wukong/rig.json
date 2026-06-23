@@ -334,5 +334,14 @@
       "minRot": -65,
       "maxRot": 65
     }
-  ]
+  ],
+  "bindingPose": {
+    "root": { "x": 0, "y": -54 },
+    "angleOffsets": {
+      "upper_arm_l": 20,
+      "upper_arm_r": -20,
+      "lower_arm_l": 10,
+      "lower_arm_r": -12
+    }
+  }
 }

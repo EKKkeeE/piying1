@@ -263,6 +263,8 @@ export class FingerMarionette {
     this._moveDirect = false;
     this._initLimbs(rigData);
     this._initGravityLimbs(rigData);
+    /** @type {{ root?: { x?: number, y?: number }, angleOffsets?: Record<string, number> } | null} */
+    this._bindingPose = rigData.bindingPose ?? null;
   }
 
   _initGravityLimbs(rigData) {
@@ -1532,6 +1534,29 @@ export class FingerMarionette {
       fingerNodes: [],
       handSkeleton: { landmarks: [], connections: HAND_CONNECTIONS },
     };
+  }
+
+  /** 阶段1绑定：在默认下垂站姿上微调位置与四肢角度 */
+  getBindingPose() {
+    const pose = this.getInitialPose();
+    const bp = this._bindingPose;
+    if (!bp) return pose;
+
+    pose.root = {
+      x: bp.root?.x ?? 0,
+      y: bp.root?.y ?? 0,
+      rotation: 0,
+    };
+
+    const offsets = bp.angleOffsets ?? {};
+    for (const [name, off] of Object.entries(offsets)) {
+      if (pose.bones[name] == null || off === 0) continue;
+      const limb = this.limbs.get(name);
+      const min = limb?.minRot ?? -88;
+      const max = limb?.maxRot ?? 88;
+      pose.bones[name] = clamp(pose.bones[name] + off, min, max);
+    }
+    return pose;
   }
 
   getHoldPose() {

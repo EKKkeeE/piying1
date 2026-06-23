@@ -3,19 +3,24 @@ import { FingerMarionette } from "./fingerMarionette.js";
 import { StringLines } from "./stringLines.js";
 import { LayoutCache } from "./layoutCache.js";
 import { createHandDetector, TARGET_DETECT_FPS } from "./handDetect.js";
+import { BgmPlayer } from "./bgm.js";
+import { BindingPhase } from "./bindingPhase.js";
+import { StoneSlab } from "./stoneSlab.js";
+import { ShatterEffect } from "./shatterEffect.js";
 
 const CAMERA_TARGET_FPS = 60;
 /** 皮影模拟固定步长，与手部检测对齐，避免高刷屏 variable-dt 插值节奏错乱 */
 const SIM_DT = 1 / TARGET_DETECT_FPS;
 const MAX_SIM_STEPS = 3;
-import { CurtainAnimation } from "./curtainAnimation.js";
-import { BgmPlayer } from "./bgm.js";
 const DEBUG =
   new URLSearchParams(location.search).has("debug") ||
   new URLSearchParams(location.search).has("d");
 const FORCE_CPU = new URLSearchParams(location.search).has("cpu");
 /** MediaPipe 是否成功启用 GPU 推理 */
 let gpuHandEnabled = false;
+
+/** @type {'binding' | 'free'} */
+let experiencePhase = "binding";
 
 /** @type {import('@mediapipe/tasks-vision').HandLandmarker | null} */
 let handLandmarker = null;
@@ -28,6 +33,13 @@ let stringLines = null;
 let layoutCache = null;
 /** @type {ReturnType<createHandDetector> | null} */
 let handDetector = null;
+/** @type {BindingPhase | null} */
+let bindingPhase = null;
+/** @type {StoneSlab | null} */
+let stoneSlab = null;
+/** @type {ShatterEffect | null} */
+let shatterEffect = null;
+let shatterStarted = false;
 let running = false;
 let animId = 0;
 let lastTs = 0;
@@ -52,13 +64,16 @@ const els = {
   stageInteraction: document.getElementById("stage-interaction"),
   puppetMountPlayer: document.getElementById("puppet-mount-player"),
   stage: document.getElementById("stage"),
-  stageCurtain: document.getElementById("stage-curtain"),
+  stageStone: document.getElementById("stage-stone"),
+  bindingHint: document.getElementById("binding-hint"),
+  shatterCanvas: /** @type {HTMLCanvasElement} */ (
+    document.getElementById("stone-shatter-canvas")
+  ),
 };
 
-/** @type {CurtainAnimation | null} */
-let curtainAnim = null;
 /** @type {BgmPlayer | null} */
 let bgm = null;
+
 function showError(msg) {
   els.errorBox.textContent = msg;
   els.errorBox.hidden = false;
@@ -194,7 +209,20 @@ function applyPose(pose) {
   }
 }
 
+function applyBindingSpawn() {
+  if (!fingerCtrl || !playerRig) return;
+  const pose = fingerCtrl.getBindingPose();
+  fingerCtrl.root = { x: pose.root.x, y: pose.root.y, rotation: 0 };
+  lastPose = pose;
+  applyPose(pose);
+  playerRig.update(0, { direct: true });
+}
+
 function initSpawnPositions() {
+  if (experiencePhase === "binding") {
+    applyBindingSpawn();
+    return;
+  }
   const playerX = 0;
   playerRig?.setRootTransform(playerX, 0, 0);
   if (fingerCtrl) {
@@ -231,25 +259,168 @@ function drawDebugHands(result) {
   }
 }
 
-function loop(ts) {
-  if (!running) return;
-  animId = requestAnimationFrame(loop);
+function clearShatterShake() {
+  const t = "translate(0px, 0px)";
+  if (els.stageStone) els.stageStone.style.transform = t;
+  if (els.stage) els.stage.style.transform = t;
+  if (els.puppetMountPlayer) els.puppetMountPlayer.style.transform = t;
+  if (els.stageInteraction) els.stageInteraction.style.transform = t;
+}
 
-  const frameDt = lastTs ? Math.min((ts - lastTs) / 1000, 0.1) : SIM_DT;
-  lastTs = ts;
+function applyShatterShake() {
+  if (!shatterEffect?.active) return;
+  const { x, y } = shatterEffect.getShake();
+  const t = `translate(${x.toFixed(2)}px, ${y.toFixed(2)}px)`;
+  if (els.stageStone && !els.stageStone.classList.contains("stone-hidden")) {
+    els.stageStone.style.transform = t;
+  }
+  if (els.stage) els.stage.style.transform = t;
+  if (els.puppetMountPlayer) els.puppetMountPlayer.style.transform = t;
+  if (els.stageInteraction) els.stageInteraction.style.transform = t;
+}
 
-  if (handLandmarker && handDetector && fingerCtrl && playerRig && layoutCache) {
-    const handTick = handDetector.tick(handLandmarker, ts);
+function enterFreePhase() {
+  experiencePhase = "free";
+  bindingPhase?.markDone();
+  clearShatterShake();
+  revealStageBackground();
+  hideStoneLayer();
+  if (els.bindingHint) {
+    els.bindingHint.hidden = true;
+    els.bindingHint.classList.remove("pulse-hint");
+  }
+  if (!shatterStarted) {
+    lastPose = fingerCtrl?.getInitialPose() ?? null;
+    if (lastPose) applyPose(lastPose);
+  }
+  simAccum = 0;
+  handDetector?.reset();
+  if (!bgm) bgm = new BgmPlayer();
+  bgm.scheduleStart(1500);
+}
+
+function revealStageBackground() {
+  els.stage?.classList.remove("stage-hidden");
+  els.stage?.classList.add("stage-visible");
+}
+
+function hideStoneLayer() {
+  stoneSlab?.hideSlab();
+  if (els.stageStone) {
+    els.stageStone.classList.remove("stone-shattering");
+    els.stageStone.classList.add("stone-hidden");
+    els.stageStone.style.opacity = "";
+  }
+}
+
+function beginShatterPuppetControl() {
+  if (!fingerCtrl || !playerRig) return;
+  simAccum = 0;
+  fingerCtrl.root = {
+    x: playerRig.rootExtra.x,
+    y: playerRig.rootExtra.y,
+    rotation: 0,
+  };
+  for (const [name, limb] of fingerCtrl.limbs) {
+    const deg = playerRig.displayRotations[name];
+    if (deg != null) limb.angle = deg;
+  }
+}
+
+function startShatter() {
+  if (shatterStarted || !stoneSlab || !shatterEffect || !els.stageStone) return;
+  shatterStarted = true;
+
+  beginShatterPuppetControl();
+
+  stoneSlab.draw({});
+  const rect = els.stageStone.getBoundingClientRect();
+
+  shatterEffect.resize(rect.width, rect.height);
+  els.stageStone.classList.add("stone-shattering");
+
+  if (els.bindingHint) {
+    els.bindingHint.hidden = true;
+  }
+
+  const center = stoneSlab.getPuppetCenter(rect.width, rect.height);
+
+  shatterEffect.start(
+    rect.width,
+    rect.height,
+    center.x,
+    center.y,
+    stoneSlab.canvas,
+    {
+      onImpact: () => {
+        revealStageBackground();
+        stoneSlab.hideSlab();
+      },
+    }
+  );
+}
+
+function initBindingPhase() {
+  if (!els.stageStone || !els.shatterCanvas) return;
+
+  stoneSlab = new StoneSlab(els.stageStone);
+  stoneSlab.resize();
+  shatterEffect = new ShatterEffect(els.shatterCanvas, enterFreePhase);
+  shatterStarted = false;
+
+  bindingPhase = new BindingPhase({
+    getGrooveBounds: (w, h) => stoneSlab.getGrooveBounds(w, h),
+    getGrooveAnchors: (w, h) => stoneSlab.getGrooveAnchors(w, h),
+    onRestoreParts: (parts) => playerRig?.restorePartColor(parts),
+    onRevertParts: (parts) => playerRig?.revertPartsToDust(parts),
+    onShatterStart: startShatter,
+  });
+
+  experiencePhase = "binding";
+  els.stage?.classList.add("stage-hidden");
+  els.stage?.classList.remove("stage-visible");
+  els.stageStone.classList.remove("stone-hidden");
+  if (els.bindingHint) {
+    els.bindingHint.hidden = false;
+    els.bindingHint.textContent = "将左手放入凹槽，绑定皮影";
+  }
+
+  playerRig?.enableDustMode();
+  applyBindingSpawn();
+
+  stoneSlab.ready().then(() => {
+    stoneSlab?.resize();
+    stoneSlab?.draw({});
+  });
+}
+
+/**
+ * @param {number} ts
+ * @param {number} frameDt
+ */
+function loopBinding(ts, frameDt) {
+  if (!handLandmarker || !handDetector || !playerRig || !layoutCache || !bindingPhase) {
+    return;
+  }
+
+  const handTick = handDetector.tick(handLandmarker, ts);
+  const handResult = handTick?.result ?? handDetector.getCached();
+
+  layoutCache.refresh(true);
+  const stageRect = layoutCache.stageRect;
+  const phase = bindingPhase.update(frameDt, handResult, stageRect, playerRig);
+
+  if (phase.shatterTriggered && !shatterStarted) {
+    startShatter();
+  }
+
+  const shatterActive = shatterEffect?.active;
+
+  if (shatterActive && fingerCtrl) {
     if (handTick?.fresh) {
-      fingerCtrl.updateFromHand(handTick.result, layoutCache);
-      if (DEBUG) drawDebugHands(handTick.result);
+      fingerCtrl.updateFromHand(handResult, layoutCache);
+      if (DEBUG) drawDebugHands(handResult);
     }
-
-    if (!lastPose) {
-      lastPose = fingerCtrl.getInitialPose();
-      applyPose(lastPose);
-    }
-
     layoutCache.refresh();
 
     simAccum = Math.min(simAccum + frameDt, SIM_DT * MAX_SIM_STEPS);
@@ -267,23 +438,143 @@ function loop(ts) {
       direct: true,
       alpha: pose?.hasHand ? 0.45 : 0.12,
     });
+  } else {
+    if (DEBUG && handTick?.fresh) drawDebugHands(handResult);
 
+    layoutCache.refresh(true);
+
+    if (!lastPose && fingerCtrl) {
+      lastPose = fingerCtrl.getBindingPose();
+    }
+    if (lastPose) {
+      playerRig.applyKinematicSnapshot(
+        lastPose.bones ?? {},
+        lastPose.root?.x ?? 0,
+        lastPose.root?.y ?? 0,
+        0
+      );
+    }
+    playerRig.update(SIM_DT, { idle: true, direct: true, alpha: 0.08 });
+  }
+
+  if (els.bindingHint) {
+    els.bindingHint.textContent = phase.hintText;
+    els.bindingHint.classList.toggle("pulse-hint", phase.pulseShake);
+  }
+
+  if (stoneSlab && phase.state !== "shattering" && !shatterActive) {
+    stoneSlab.draw({
+      glowEdge: phase.glowEdge,
+      grooveBreathe: phase.grooveBreathe,
+      pulseShake: phase.pulseShake,
+      dt: frameDt,
+    });
+  }
+
+  if (shatterActive) {
+    shatterEffect.update(frameDt);
+    shatterEffect.draw();
+    applyShatterShake();
+  }
+
+  if (shatterActive && fingerCtrl && lastPose) {
     const strings = fingerCtrl.buildStringsFromDom(playerRig, layoutCache);
     const handSkeleton = fingerCtrl.syncHandSkeletonWithStrings(
       lastPose.handSkeleton ?? { landmarks: [], connections: [] },
       strings
     );
-
-    stringLines?.draw({
-      fingerNodes: [],
-      strings: strings.length ? strings : lastPose.strings ?? [],
-      handSkeleton,
-    });
-
+    stringLines?.draw({ strings, handSkeleton });
   } else {
-    simAccum = 0;
-    playerRig?.update(SIM_DT, { idle: true, alpha: 0.1 });
+    stringLines?.draw({
+      strings: phase.strings,
+      handSkeleton: phase.handSkeleton,
+      bindingMode: true,
+      debug:
+        DEBUG && !shatterActive
+          ? {
+              anchors: stoneSlab?.getGrooveAnchors(
+                stageRect.width,
+                stageRect.height
+              ),
+              bounds: stoneSlab?.getGrooveBounds(
+                stageRect.width,
+                stageRect.height
+              ),
+              distances: phase.debugDistances,
+              fitRadius: phase.fitRadius,
+              fitInCount: phase.fitInCount,
+              shakeIntensity: phase.shakeIntensity,
+            shakeSustain: phase.shakeSustain,
+            }
+          : undefined,
+    });
   }
+}
+
+/**
+ * @param {number} ts
+ * @param {number} frameDt
+ */
+function loopFree(ts, frameDt) {
+  if (!handLandmarker || !handDetector || !fingerCtrl || !playerRig || !layoutCache) {
+    return;
+  }
+
+  const handTick = handDetector.tick(handLandmarker, ts);
+  if (handTick?.fresh) {
+    fingerCtrl.updateFromHand(handTick.result, layoutCache);
+    if (DEBUG) drawDebugHands(handTick.result);
+  }
+
+  if (!lastPose) {
+    lastPose = fingerCtrl.getInitialPose();
+    applyPose(lastPose);
+  }
+
+  layoutCache.refresh();
+
+  simAccum = Math.min(simAccum + frameDt, SIM_DT * MAX_SIM_STEPS);
+  let steps = 0;
+  while (simAccum >= SIM_DT && steps < MAX_SIM_STEPS) {
+    simAccum -= SIM_DT;
+    steps += 1;
+    lastPose = fingerCtrl.step(SIM_DT, playerRig, layoutCache);
+    applyPose(lastPose);
+  }
+
+  const pose = lastPose;
+  playerRig.update(SIM_DT, {
+    idle: !pose?.hasHand,
+    direct: true,
+    alpha: pose?.hasHand ? 0.45 : 0.12,
+  });
+
+  const strings = fingerCtrl.buildStringsFromDom(playerRig, layoutCache);
+  const handSkeleton = fingerCtrl.syncHandSkeletonWithStrings(
+    lastPose.handSkeleton ?? { landmarks: [], connections: [] },
+    strings
+  );
+
+  stringLines?.draw({
+    fingerNodes: [],
+    strings: strings.length ? strings : lastPose.strings ?? [],
+    handSkeleton,
+  });
+}
+
+function loop(ts) {
+  if (!running) return;
+  animId = requestAnimationFrame(loop);
+
+  const frameDt = lastTs ? Math.min((ts - lastTs) / 1000, 0.1) : SIM_DT;
+  lastTs = ts;
+
+  if (experiencePhase === "binding") {
+    loopBinding(ts, frameDt);
+    return;
+  }
+
+  loopFree(ts, frameDt);
 }
 
 async function initPuppet() {
@@ -332,15 +623,11 @@ async function startExperience() {
     stringLines.resize();
 
     await initPuppet();
+    initBindingPhase();
 
     els.startOverlay.classList.add("hidden");
 
-    if (!curtainAnim && els.stageCurtain) {
-      curtainAnim = new CurtainAnimation(els.stageCurtain);
-    }
     if (!bgm) bgm = new BgmPlayer();
-    bgm.scheduleStart(3000);
-    await curtainAnim?.play();
 
     running = true;
     lastTs = 0;
@@ -362,11 +649,6 @@ async function startExperience() {
 
 els.startBtn?.addEventListener("click", startExperience);
 
-if (els.stageCurtain) {
-  curtainAnim = new CurtainAnimation(els.stageCurtain);
-  curtainAnim.preload().catch(() => {});
-}
-
 window.addEventListener("pagehide", () => {
   running = false;
   cancelAnimationFrame(animId);
@@ -377,7 +659,11 @@ window.addEventListener("pagehide", () => {
 window.addEventListener("resize", () => {
   stringLines?.resize();
   layoutCache?.refresh(true);
-  curtainAnim?.resize();
+  stoneSlab?.resize();
+  if (els.stageStone && shatterEffect) {
+    const rect = els.stageStone.getBoundingClientRect();
+    shatterEffect.resize(rect.width, rect.height);
+  }
   initSpawnPositions();
   if (DEBUG && els.video.videoWidth) {
     els.debugCanvas.width = els.video.videoWidth;

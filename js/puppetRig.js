@@ -426,4 +426,44 @@ export class PuppetRig {
     }
     this.rootExtra = { x: 0, y: 0, rotation: 0 };
   }
+
+  /** 阶段1：全部件灰度 + 灰尘 */
+  enableDustMode() {
+    this.wrapper.classList.add("puppet-dusty");
+    for (const name of Object.keys(this.parts)) {
+      const entry = this.partEls.get(name);
+      if (entry) entry.el.classList.add("part-dusty");
+    }
+  }
+
+  /** @param {string[]} partNames */
+  revertPartsToDust(partNames) {
+    if (!partNames?.length) return;
+    this.wrapper.classList.add("puppet-dusty");
+    for (const name of partNames) {
+      const entry = this.partEls.get(name);
+      if (!entry) continue;
+      entry.el.classList.remove("part-dust-clearing");
+      entry.el.classList.add("part-dusty");
+    }
+  }
+
+  /** @param {string[]} partNames */
+  restorePartColor(partNames) {
+    for (const name of partNames) {
+      const entry = this.partEls.get(name);
+      if (!entry) continue;
+      entry.el.classList.remove("part-dusty");
+      entry.el.classList.add("part-dust-clearing");
+      entry.el.addEventListener(
+        "animationend",
+        () => entry.el.classList.remove("part-dust-clearing"),
+        { once: true }
+      );
+    }
+    const allClear = [...this.partEls.values()].every(
+      (e) => !e.el.classList.contains("part-dusty")
+    );
+    if (allClear) this.wrapper.classList.remove("puppet-dusty");
+  }
 }

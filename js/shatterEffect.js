@@ -2,6 +2,111 @@
  * 石板震碎：蓄力颤动 → 冲击爆裂为碎石 → 舞台露出 → 余震
  */
 
+/** @param {{ x: number, y: number }} a @param {{ x: number, y: number }} b */
+function _closerToA(px, py, ax, ay, bx, by) {
+  const dax = px - ax;
+  const day = py - ay;
+  const dbx = px - bx;
+  const dby = py - by;
+  return dax * dax + day * day < dbx * dbx + dby * dby;
+}
+
+/** @param {Array<{ x: number, y: number }>} poly */
+function _polygonArea(poly) {
+  let area = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(area) * 0.5;
+}
+
+/** @param {Array<{ x: number, y: number }>} poly */
+function _polygonCentroid(poly) {
+  let cx = 0;
+  let cy = 0;
+  let area = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const cross = a.x * b.y - b.x * a.y;
+    area += cross;
+    cx += (a.x + b.x) * cross;
+    cy += (a.y + b.y) * cross;
+  }
+  area *= 0.5;
+  if (Math.abs(area) < 1e-6) {
+    const n = poly.length;
+    return {
+      x: poly.reduce((s, p) => s + p.x, 0) / n,
+      y: poly.reduce((s, p) => s + p.y, 0) / n,
+    };
+  }
+  const f = 1 / (6 * area);
+  return { x: cx * f, y: cy * f };
+}
+
+/**
+ * @param {{ x: number, y: number }} p1
+ * @param {{ x: number, y: number }} p2
+ */
+function _bisectorIntersect(p1, p2, ax, ay, bx, by) {
+  const a1 = 2 * (bx - ax);
+  const b1 = 2 * (by - ay);
+  const c1 = bx * bx + by * by - ax * ax - ay * ay;
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const denom = a1 * dx + b1 * dy;
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = (c1 - a1 * p1.x - b1 * p1.y) / denom;
+  if (t < 0 || t > 1) return null;
+  return { x: p1.x + dx * t, y: p1.y + dy * t };
+}
+
+/** @param {Array<{ x: number, y: number }>} poly */
+function _clipHalfPlane(poly, ax, ay, bx, by) {
+  if (!poly.length) return [];
+  const inside = (px, py) => _closerToA(px, py, ax, ay, bx, by);
+  const out = [];
+
+  for (let i = 0; i < poly.length; i++) {
+    const cur = poly[i];
+    const prev = poly[(i - 1 + poly.length) % poly.length];
+    const curIn = inside(cur.x, cur.y);
+    const prevIn = inside(prev.x, prev.y);
+
+    if (curIn) {
+      if (!prevIn) {
+        const hit = _bisectorIntersect(prev, cur, ax, ay, bx, by);
+        if (hit) out.push(hit);
+      }
+      out.push(cur);
+    } else if (prevIn) {
+      const hit = _bisectorIntersect(prev, cur, ax, ay, bx, by);
+      if (hit) out.push(hit);
+    }
+  }
+  return out;
+}
+
+/** @param {{ x: number, y: number }} seed @param {Array<{ x: number, y: number }>} seeds */
+function _voronoiCell(seed, seeds, bounds) {
+  let poly = [
+    { x: bounds.x, y: bounds.y },
+    { x: bounds.x + bounds.w, y: bounds.y },
+    { x: bounds.x + bounds.w, y: bounds.y + bounds.h },
+    { x: bounds.x, y: bounds.y + bounds.h },
+  ];
+
+  for (const other of seeds) {
+    if (other === seed) continue;
+    poly = _clipHalfPlane(poly, seed.x, seed.y, other.x, other.y);
+    if (poly.length < 3) return null;
+  }
+  return poly;
+}
+
 export class ShatterEffect {
   /**
    * @param {HTMLCanvasElement} canvas
@@ -80,44 +185,82 @@ export class ShatterEffect {
     this.canvas.classList.add("shatter-active");
   }
 
+  _generateShatterSeeds(cx, cy, w, h) {
+    const count = 58 + Math.floor(Math.random() * 18);
+    const seeds = [];
+    const minDist = Math.min(w, h) * 0.055;
+
+    for (let i = 0; i < count; i++) {
+      let x;
+      let y;
+      let ok = false;
+
+      for (let attempt = 0; attempt < 24; attempt++) {
+        if (i < count * 0.45) {
+          const angle = Math.random() * Math.PI * 2;
+          const dist = Math.pow(Math.random(), 0.55) * Math.min(w, h) * 0.34;
+          x = cx + Math.cos(angle) * dist;
+          y = cy + Math.sin(angle) * dist;
+        } else {
+          x = Math.random() * w;
+          y = Math.random() * h;
+        }
+
+        x = Math.max(4, Math.min(w - 4, x));
+        y = Math.max(4, Math.min(h - 4, y));
+        ok = seeds.every(
+          (s) => Math.hypot(s.x - x, s.y - y) >= minDist * (0.72 + Math.random() * 0.36)
+        );
+        if (ok) break;
+      }
+
+      if (!ok) {
+        x = Math.random() * w;
+        y = Math.random() * h;
+      }
+      seeds.push({ x, y });
+    }
+
+    return seeds;
+  }
+
   _buildShards() {
     const w = this._w;
     const h = this._h;
     const cx = this._cx;
     const cy = this._cy;
-    const cols = 16;
-    const rows = 11;
-    const cellW = w / cols;
-    const cellH = h / rows;
+    const seeds = this._generateShatterSeeds(cx, cy, w, h);
+    const bounds = { x: 0, y: 0, w, h };
+    const minArea = w * h * 0.00045;
 
-    for (let row = 0; row < rows; row++) {
-      for (let col = 0; col < cols; col++) {
-        const sx = col * cellW;
-        const sy = row * cellH;
-        const px = sx + cellW * 0.5;
-        const py = sy + cellH * 0.5;
-        const dx = px - cx;
-        const dy = py - cy;
-        const dist = Math.hypot(dx, dy) || 1;
-        const nx = dx / dist;
-        const ny = dy / dist;
-        const burst = 380 + Math.random() * 320 + dist * 0.3;
+    for (const seed of seeds) {
+      const poly = _voronoiCell(seed, seeds, bounds);
+      if (!poly || poly.length < 3) continue;
 
-        this._shards.push({
-          sx,
-          sy,
-          sw: cellW + 1,
-          sh: cellH + 1,
-          x: px,
-          y: py,
-          w: cellW,
-          h: cellH,
-          vx: nx * burst + (Math.random() - 0.5) * 150,
-          vy: ny * burst * 0.68 - 180 - Math.random() * 110,
-          rot: Math.random() * Math.PI,
-          vr: (Math.random() - 0.5) * 18,
-        });
-      }
+      const area = _polygonArea(poly);
+      if (area < minArea) continue;
+
+      const center = _polygonCentroid(poly);
+      const dx = center.x - cx;
+      const dy = center.y - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+      const nx = dx / dist;
+      const ny = dy / dist;
+      const burst = 380 + Math.random() * 320 + dist * 0.3;
+      const localPoly = poly.map((p) => ({
+        x: p.x - center.x,
+        y: p.y - center.y,
+      }));
+
+      this._shards.push({
+        localPoly,
+        x: center.x,
+        y: center.y,
+        vx: nx * burst + (Math.random() - 0.5) * 150,
+        vy: ny * burst * 0.68 - 180 - Math.random() * 110,
+        rot: Math.random() * Math.PI,
+        vr: (Math.random() - 0.5) * 18,
+      });
     }
 
     for (let i = 0; i < 72; i++) {
@@ -284,21 +427,22 @@ export class ShatterEffect {
 
     if (src && shardFade > 0.02) {
       for (const shard of this._shards) {
+        const dx = shard.x + sx * 0.55;
+        const dy = shard.y + sy * 0.55;
+
         ctx.save();
         ctx.globalAlpha = shardFade * 0.98;
-        ctx.translate(shard.x + sx * 0.55, shard.y + sy * 0.55);
+        ctx.translate(dx, dy);
         ctx.rotate(shard.rot);
-        ctx.drawImage(
-          src,
-          shard.sx * (src.width / w),
-          shard.sy * (src.height / h),
-          shard.sw * (src.width / w),
-          shard.sh * (src.height / h),
-          -shard.w / 2,
-          -shard.h / 2,
-          shard.w,
-          shard.h
-        );
+        ctx.beginPath();
+        for (const p of shard.localPoly) {
+          ctx.lineTo(p.x, p.y);
+        }
+        ctx.closePath();
+        ctx.clip();
+        ctx.rotate(-shard.rot);
+        ctx.translate(-dx, -dy);
+        ctx.drawImage(src, 0, 0, w, h);
         ctx.restore();
       }
     }

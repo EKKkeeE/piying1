@@ -46,6 +46,8 @@ let lastTs = 0;
 let simAccum = 0;
 /** @type {{ hasHand: boolean, bones: object, strings: Array } | null} */
 let lastPose = null;
+/** 阶段1分段操控是否激活（用于中断时复位姿态） */
+let bindingPartialActive = false;
 /** @type {MediaStream | null} */
 let cameraStream = null;
 
@@ -315,6 +317,7 @@ function hideStoneLayer() {
 
 function beginShatterPuppetControl() {
   if (!fingerCtrl || !playerRig) return;
+  fingerCtrl.setBindingPhaseControl(null);
   simAccum = 0;
   fingerCtrl.root = {
     x: playerRig.rootExtra.x,
@@ -417,6 +420,7 @@ function loopBinding(ts, frameDt) {
   const shatterActive = shatterEffect?.active;
 
   if (shatterActive && fingerCtrl) {
+    fingerCtrl.setBindingPhaseControl(null);
     if (handTick?.fresh) {
       fingerCtrl.updateFromHand(handResult, layoutCache);
       if (DEBUG) drawDebugHands(handResult);
@@ -438,23 +442,64 @@ function loopBinding(ts, frameDt) {
       direct: true,
       alpha: pose?.hasHand ? 0.45 : 0.12,
     });
+    bindingPartialActive = false;
   } else {
     if (DEBUG && handTick?.fresh) drawDebugHands(handResult);
 
     layoutCache.refresh(true);
 
-    if (!lastPose && fingerCtrl) {
-      lastPose = fingerCtrl.getBindingPose();
+    const partialReady =
+      (phase.state === "binding" || phase.state === "shakePrompt") &&
+      phase.boundIds.size > 0;
+
+    if (partialReady && fingerCtrl) {
+      if (phase.state === "shakePrompt") {
+        fingerCtrl.setBindingPhaseControl(null);
+      } else {
+        fingerCtrl.setBindingPhaseControl(phase.boundIds, true);
+      }
+
+      if (handTick?.fresh) {
+        fingerCtrl.updateFromHand(handResult, layoutCache);
+      }
+      layoutCache.refresh();
+
+      simAccum = Math.min(simAccum + frameDt, SIM_DT * MAX_SIM_STEPS);
+      let steps = 0;
+      while (simAccum >= SIM_DT && steps < MAX_SIM_STEPS) {
+        simAccum -= SIM_DT;
+        steps += 1;
+        lastPose = fingerCtrl.step(SIM_DT, playerRig, layoutCache);
+        applyPose(lastPose);
+      }
+
+      const pose = lastPose;
+      playerRig.update(SIM_DT, {
+        idle: !pose?.hasHand,
+        direct: true,
+        alpha: pose?.hasHand ? 0.38 : 0.08,
+      });
+      bindingPartialActive = true;
+    } else {
+      fingerCtrl?.setBindingPhaseControl(null);
+      if (bindingPartialActive) {
+        applyBindingSpawn();
+        bindingPartialActive = false;
+      }
+
+      if (!lastPose && fingerCtrl) {
+        lastPose = fingerCtrl.getBindingPose();
+      }
+      if (lastPose) {
+        playerRig.applyKinematicSnapshot(
+          lastPose.bones ?? {},
+          lastPose.root?.x ?? 0,
+          lastPose.root?.y ?? 0,
+          0
+        );
+      }
+      playerRig.update(SIM_DT, { idle: true, direct: true, alpha: 0.08 });
     }
-    if (lastPose) {
-      playerRig.applyKinematicSnapshot(
-        lastPose.bones ?? {},
-        lastPose.root?.x ?? 0,
-        lastPose.root?.y ?? 0,
-        0
-      );
-    }
-    playerRig.update(SIM_DT, { idle: true, direct: true, alpha: 0.08 });
   }
 
   if (els.bindingHint) {

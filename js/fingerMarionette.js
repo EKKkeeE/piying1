@@ -265,6 +265,48 @@ export class FingerMarionette {
     this._initGravityLimbs(rigData);
     /** @type {{ root?: { x?: number, y?: number }, angleOffsets?: Record<string, number> } | null} */
     this._bindingPose = rigData.bindingPose ?? null;
+    /** @type {Set<string> | null} 阶段1已绑定提线；null 表示非分段操控 */
+    this._phaseBoundIds = null;
+    this._phaseLockTorso = false;
+  }
+
+  /**
+   * 阶段1分段操控：仅 boundIds 中的提线驱动肢体；lockTorso 时躯干与根位固定。
+   * @param {Set<string> | Iterable<string> | null} boundIds null 表示完整操控
+   * @param {boolean} [lockTorso]
+   */
+  setBindingPhaseControl(boundIds, lockTorso = false) {
+    if (!boundIds) {
+      this._phaseBoundIds = null;
+      this._phaseLockTorso = false;
+      return;
+    }
+    this._phaseBoundIds =
+      boundIds instanceof Set ? boundIds : new Set(boundIds);
+    this._phaseLockTorso = lockTorso;
+  }
+
+  _isPhaseBindingActive(bindingId) {
+    if (!this._phaseBoundIds) return true;
+    return this._phaseBoundIds.has(bindingId);
+  }
+
+  /** 未绑定肢体锁回 bindingPose 初始角度 */
+  _pinUnboundPartsToBindingPose(bonesOut, rig, boundIds) {
+    const pose = this.getBindingPose();
+    for (const binding of this.bindings) {
+      if (boundIds.has(binding.id)) continue;
+      const parts = [binding.part];
+      const parent = CHAIN_PARENT[binding.part];
+      if (parent) parts.push(parent);
+      for (const name of parts) {
+        const limb = this.limbs.get(name);
+        if (!limb || pose.bones[name] == null) continue;
+        limb.angle = pose.bones[name];
+        bonesOut[name] = pose.bones[name];
+        rig.displayRotations[name] = pose.bones[name];
+      }
+    }
   }
 
   _initGravityLimbs(rigData) {
@@ -302,6 +344,7 @@ export class FingerMarionette {
     const out = new Set();
     if (!this.physicsActive) return out;
     for (const binding of this.bindings) {
+      if (!this._isPhaseBindingActive(binding.id)) continue;
       if (!this._fingerAssembly.has(binding.id)) continue;
       out.add(binding.part);
       const parent = CHAIN_PARENT[binding.part];
@@ -1072,6 +1115,11 @@ export class FingerMarionette {
     } else {
       this._resetHandTracking();
     }
+
+    if (this._phaseBoundIds) {
+      this.physicsActive =
+        this._phaseBoundIds.size > 0 && this.hasAnyFinger;
+    }
   }
 
   _resetHandTracking() {
@@ -1230,6 +1278,7 @@ export class FingerMarionette {
 
     for (const binding of this.bindings) {
       if (binding.id === LINE_HEAD_ID) continue;
+      if (!this._isPhaseBindingActive(binding.id)) continue;
       const limb = this.limbs.get(binding.part);
       const fingerData = this._getSolveFinger(binding.id);
       if (!limb || !fingerData) continue;
@@ -1334,8 +1383,29 @@ export class FingerMarionette {
     const headFinger = this._fingerAssembly.get(LINE_HEAD_ID);
     const torsoLimb = this.limbs.get("torso");
     const torsoPart = rig.parts?.torso;
+    const partial = this._phaseBoundIds != null;
+    const lockTorso = partial && this._phaseLockTorso;
+    const boundIds = this._phaseBoundIds ?? new Set();
 
-    if (headFinger && torsoLimb && torsoPart && headBinding && this.physicsActive) {
+    let runPhysics = false;
+    if (partial) {
+      runPhysics =
+        boundIds.size > 0 &&
+        this.physicsActive &&
+        (!lockTorso
+          ? !!(headFinger && torsoLimb && torsoPart && headBinding)
+          : true);
+    } else {
+      runPhysics = !!(
+        headFinger &&
+        torsoLimb &&
+        torsoPart &&
+        headBinding &&
+        this.physicsActive
+      );
+    }
+
+    if (runPhysics) {
       const motion = this._maxFingerMotion();
       const settling = this._isSettling();
       const moveDirect = this._shouldMoveDirect(
@@ -1350,41 +1420,59 @@ export class FingerMarionette {
       );
 
       this._tickDisplayFingers(dt, response, moveDirect);
-      this._tickTorsoFingers(dt);
+      if (!lockTorso) {
+        this._tickTorsoFingers(dt);
+      }
 
-      const headStage =
-        this._displayFingers.get(LINE_HEAD_ID) ?? headFinger.fingerStage;
-      if (headStage) {
-        this._placeRootFromFinger(
-          layout,
-          headStage,
-          headStringDropPx(layout, headBinding),
-          response.rootSpeed,
-          dt,
-          moveDirect
-        );
+      const bindingPose = lockTorso ? this.getBindingPose() : null;
+
+      if (lockTorso && bindingPose) {
+        this.root.x = bindingPose.root.x;
+        this.root.y = bindingPose.root.y;
+      } else {
+        const headStage =
+          this._displayFingers.get(LINE_HEAD_ID) ?? headFinger.fingerStage;
+        if (headStage) {
+          this._placeRootFromFinger(
+            layout,
+            headStage,
+            headStringDropPx(layout, headBinding),
+            response.rootSpeed,
+            dt,
+            moveDirect
+          );
+        }
       }
 
       this._syncRootToRig(rig);
       layout.refresh(true);
 
-      const torsoTarget = this._computeTorsoPullTarget(
-        rig,
-        layout,
-        torsoLimb,
-        torsoPart,
-        headBinding
-      );
+      if (lockTorso && bindingPose && torsoLimb) {
+        const torsoAngle =
+          bindingPose.bones.torso ?? torsoLimb.angle;
+        torsoLimb.angle = torsoAngle;
+        bonesOut.torso = torsoAngle;
+        rig.displayRotations.torso = torsoAngle;
+        this._pinUnboundPartsToBindingPose(bonesOut, rig, boundIds);
+      } else if (torsoLimb && torsoPart && headBinding) {
+        const torsoTarget = this._computeTorsoPullTarget(
+          rig,
+          layout,
+          torsoLimb,
+          torsoPart,
+          headBinding
+        );
 
-      torsoLimb.angle = smoothAngleExp(
-        torsoLimb.angle,
-        torsoTarget,
-        response.torsoSpeed,
-        dt,
-        response.torsoMaxDelta
-      );
-      bonesOut.torso = torsoLimb.angle;
-      rig.displayRotations.torso = torsoLimb.angle;
+        torsoLimb.angle = smoothAngleExp(
+          torsoLimb.angle,
+          torsoTarget,
+          response.torsoSpeed,
+          dt,
+          response.torsoMaxDelta
+        );
+        bonesOut.torso = torsoLimb.angle;
+        rig.displayRotations.torso = torsoLimb.angle;
+      }
 
       this._solveLimbBindings(
         rig,
@@ -1445,6 +1533,19 @@ export class FingerMarionette {
     }
 
     this._applyGravityChain(rig, layout, bonesOut, this.physicsActive);
+
+    if (partial && lockTorso && boundIds.size > 0) {
+      const bindingPose = this.getBindingPose();
+      this.root.x = bindingPose.root.x;
+      this.root.y = bindingPose.root.y;
+      rig.setRootTransform(this.root.x, this.root.y, 0);
+      if (torsoLimb && bindingPose.bones.torso != null) {
+        torsoLimb.angle = bindingPose.bones.torso;
+        bonesOut.torso = bindingPose.bones.torso;
+        rig.displayRotations.torso = bindingPose.bones.torso;
+      }
+      this._pinUnboundPartsToBindingPose(bonesOut, rig, boundIds);
+    }
 
     rig.syncDisplayRotations(bonesOut);
 

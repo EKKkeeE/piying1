@@ -5,6 +5,8 @@ const TIP_INDICES = [0, 4, 8, 12, 16, 20];
 const WINDOW_MS = 380;
 /** 窗口内指尖累计位移达到此值视为「剧烈」 */
 export const SHAKE_THRESHOLD_PX = 155;
+/** 累计位移超过此值即视为「开始晃手」，用于启动音效 */
+export const SHAKE_AUDIO_START_PX = 38;
 /** 窗口内峰值位移至少达到此值（防止轻晃凑时长） */
 const MIN_PEAK_PX = 210;
 /** 累计剧烈晃动时长（毫秒） */

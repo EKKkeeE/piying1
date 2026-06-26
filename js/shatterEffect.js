@@ -146,6 +146,14 @@ export class ShatterEffect {
     return this.rumbleDuration;
   }
 
+  get impactFired() {
+    return this._impactFired;
+  }
+
+  get elapsed() {
+    return this._t;
+  }
+
   resize(w, h) {
     this._w = w;
     this._h = h;

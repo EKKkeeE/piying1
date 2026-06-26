@@ -466,46 +466,46 @@ export class StoneSlab {
    * @param {{ cx?: number, cy?: number, r?: number }} geo
    */
   _drawGrooveBreathe(ctx, geo = {}) {
-    const wave = 0.5 + 0.5 * Math.sin(this._pulseT * 3.1);
-    const peak = Math.pow(wave, 4);
-    const alpha = 0.12 + 0.88 * peak;
-    const blur = 14 + 56 * peak;
+    const wave = 0.5 + 0.5 * Math.sin(this._pulseT * 2.6);
+    const peak = Math.pow(wave, 2.1);
+    const alpha = 0.28 + 0.72 * peak;
+    const blur = 22 + 78 * peak;
     const { cx, cy, r } = geo.cx != null ? geo : this._grooveGeometry();
 
     if (this._grooveGlow) {
       this._drawGrooveLayer(ctx, this._grooveGlow, {
         mirrorX: true,
-        alpha: 0.12 + 0.55 * peak,
+        alpha: 0.28 + 0.62 * peak,
         blend: "screen",
       });
       this._drawGrooveGlow(ctx, {
-        alpha: 0.35 + 0.65 * peak,
+        alpha: 0.48 + 0.52 * peak,
         glow: true,
         glowAlpha: alpha,
-        glowBlur: blur * 1.55,
+        glowBlur: blur * 1.7,
         warm: true,
       });
       this._drawGrooveGlow(ctx, {
-        alpha: 0.55 + 0.45 * wave,
+        alpha: 0.62 + 0.38 * wave,
         glow: true,
-        glowAlpha: 0.7 + 0.3 * peak,
-        glowBlur: 12 + 22 * peak,
+        glowAlpha: 0.78 + 0.22 * peak,
+        glowBlur: 18 + 32 * peak,
         warm: true,
       });
-      if (peak > 0.35) {
-        const hot = (peak - 0.35) / 0.65;
+      if (peak > 0.22) {
+        const hot = (peak - 0.22) / 0.78;
         ctx.save();
-        ctx.shadowColor = `rgba(255, 248, 200, ${0.55 + 0.45 * hot})`;
-        ctx.shadowBlur = 20 + 40 * hot;
+        ctx.shadowColor = `rgba(255, 248, 200, ${0.62 + 0.38 * hot})`;
+        ctx.shadowBlur = 28 + 52 * hot;
         this._drawGrooveLayer(ctx, this._grooveGlow, {
           mirrorX: true,
-          alpha: 0.4 + 0.6 * hot,
+          alpha: 0.52 + 0.48 * hot,
           blend: "lighter",
         });
         ctx.restore();
       }
       this._drawGrooveGlow(ctx, {
-        alpha: 0.22 + 0.68 * peak,
+        alpha: 0.32 + 0.68 * peak,
         glow: false,
         warm: false,
       });
@@ -513,15 +513,15 @@ export class StoneSlab {
     }
 
     ctx.save();
-    ctx.strokeStyle = `rgba(255, 245, 180, ${0.28 + 0.72 * peak})`;
-    ctx.lineWidth = 2.5 + 3 * peak;
+    ctx.strokeStyle = `rgba(255, 245, 180, ${0.42 + 0.58 * peak})`;
+    ctx.lineWidth = 3 + 4 * peak;
     ctx.shadowColor = `rgba(255, 220, 80, ${alpha})`;
     ctx.shadowBlur = blur;
     this._strokeGrooveOutline(ctx, cx, cy, r, 1, false);
-    ctx.strokeStyle = `rgba(255, 255, 245, ${0.2 + 0.8 * peak})`;
-    ctx.lineWidth = 1.2 + 2.2 * peak;
-    ctx.shadowColor = `rgba(255, 255, 220, ${0.45 + 0.55 * peak})`;
-    ctx.shadowBlur = 8 + 28 * peak;
+    ctx.strokeStyle = `rgba(255, 255, 245, ${0.35 + 0.65 * peak})`;
+    ctx.lineWidth = 1.5 + 2.8 * peak;
+    ctx.shadowColor = `rgba(255, 255, 220, ${0.55 + 0.45 * peak})`;
+    ctx.shadowBlur = 12 + 38 * peak;
     this._strokeGrooveOutline(ctx, cx, cy, r, 1, false);
     ctx.restore();
   }
@@ -556,8 +556,8 @@ export class StoneSlab {
     }
 
     const { cx, cy, r } = this._grooveGeometry();
-    const baseGlow = grooveBreathe ? 0.28 : 0.78;
-    const baseEdge = grooveBreathe ? 0.1 : 0.35;
+    const baseGlow = grooveBreathe ? 0.42 : 0.78;
+    const baseEdge = grooveBreathe ? 0.18 : 0.35;
 
     if (this.grooveImg && this._grooveCutMask) {
       this._paintGrooveSculpt(ctx);

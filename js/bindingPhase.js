@@ -1,6 +1,5 @@
 import { landmarkToStage, BINDING_ZONE } from "./stageCoords.js";
 import { ShakeDetector } from "./shakeDetect.js";
-import { BindingSfx } from "./bindingSfx.js";
 
 const TIP_BY_FINGER = {
   thumb: 4,
@@ -60,7 +59,8 @@ const HAND_CONNECTIONS = [
 ];
 
 const HOLD_MS = 500;
-const BIND_MS = 520;
+/** 单条牵线进度时长 */
+const BIND_MS = 760;
 
 function findLeftHandIndex(handedness, landmarks) {
   for (let i = 0; i < handedness.length; i++) {
@@ -78,7 +78,8 @@ export class BindingPhase {
    *   getGrooveAnchors: (w: number, h: number) => Record<string, {x:number,y:number}>,
    *   onRestoreParts: (parts: string[]) => void,
    *   onRevertParts: (parts: string[]) => void,
-   *   onShatterStart: () => void
+   *   onShatterStart: () => void,
+   *   onLineBound?: (index: number, spec: { id: string, label: string }) => void
    * }} opts
    */
   constructor(opts) {
@@ -87,8 +88,8 @@ export class BindingPhase {
     this.onRestoreParts = opts.onRestoreParts;
     this.onRevertParts = opts.onRevertParts;
     this.onShatterStart = opts.onShatterStart;
+    this.onLineBound = opts.onLineBound;
     this.shakeDetector = new ShakeDetector();
-    this.sfx = new BindingSfx();
     this.state = "waitHand";
     this.holdMs = 0;
     this.bindIndex = 0;
@@ -271,9 +272,6 @@ export class BindingPhase {
     if (parts.length) {
       this.onRevertParts?.(parts);
     }
-    if (hadProgress) {
-      this.sfx.playStringBreak();
-    }
     this.boundIds.clear();
     this.bindIndex = 0;
     this.bindProgress = 0;
@@ -389,8 +387,7 @@ export class BindingPhase {
       if (this.bindProgress >= 1) {
         this.boundIds.add(spec.id);
         this.onRestoreParts(spec.parts);
-        this.sfx.playBindFlash();
-        this.sfx.playDustShake();
+        this.onLineBound?.(this.bindIndex, spec);
         this.bindIndex += 1;
         this.bindProgress = 0;
         if (this.bindIndex >= BINDING_SEQUENCE.length) {
@@ -419,8 +416,7 @@ export class BindingPhase {
           this.state = "shattering";
           this.shatterTriggered = true;
           this.onShatterStart();
-          this.sfx.playShatter();
-        }
+      }
       }
     }
 

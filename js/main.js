@@ -3,10 +3,14 @@ import { FingerMarionette } from "./fingerMarionette.js";
 import { StringLines } from "./stringLines.js";
 import { LayoutCache } from "./layoutCache.js";
 import { createHandDetector, TARGET_DETECT_FPS } from "./handDetect.js";
-import { BgmPlayer } from "./bgm.js";
 import { BindingPhase } from "./bindingPhase.js";
 import { StoneSlab } from "./stoneSlab.js";
 import { ShatterEffect } from "./shatterEffect.js";
+import { RescueSuccessOverlay } from "./rescueSuccess.js";
+import { BindingLineAudio } from "./bindingAudio.js";
+import { StoneShatterAudio } from "./stoneShatterAudio.js";
+import { SHAKE_AUDIO_START_PX } from "./shakeDetect.js";
+import { RescueSuccessAudio } from "./rescueSuccessAudio.js";
 
 const CAMERA_TARGET_FPS = 60;
 /** 皮影模拟固定步长，与手部检测对齐，避免高刷屏 variable-dt 插值节奏错乱 */
@@ -39,7 +43,21 @@ let bindingPhase = null;
 let stoneSlab = null;
 /** @type {ShatterEffect | null} */
 let shatterEffect = null;
+/** @type {RescueSuccessOverlay | null} */
+let rescueSuccess = null;
+/** @type {BindingLineAudio | null} */
+let bindingLineAudio = null;
+/** @type {StoneShatterAudio | null} */
+let stoneShatterAudio = null;
+/** @type {RescueSuccessAudio | null} */
+let rescueSuccessAudio = null;
+/** 晃手提示音效是否已启动 */
+let shakePromptAudioActive = false;
 let shatterStarted = false;
+/** @type {{ x: number, y: number, remain: number }} */
+let rescueShake = { x: 0, y: 0, remain: 0 };
+/** @type {{ y: number, remain: number, duration: number }} */
+let rescueLeap = { y: 0, remain: 0, duration: 0.55 };
 let running = false;
 let animId = 0;
 let lastTs = 0;
@@ -71,10 +89,8 @@ const els = {
   shatterCanvas: /** @type {HTMLCanvasElement} */ (
     document.getElementById("stone-shatter-canvas")
   ),
+  rescueSuccess: document.getElementById("rescue-success"),
 };
-
-/** @type {BgmPlayer | null} */
-let bgm = null;
 
 function showError(msg) {
   els.errorBox.textContent = msg;
@@ -213,8 +229,10 @@ function applyPose(pose) {
 
 function applyBindingSpawn() {
   if (!fingerCtrl || !playerRig) return;
+  fingerCtrl.invalidateBindingPoseSnapshot();
   const pose = fingerCtrl.getBindingPose();
   fingerCtrl.root = { x: pose.root.x, y: pose.root.y, rotation: 0 };
+  fingerCtrl.syncLimbsToBindingPose(pose.bones);
   lastPose = pose;
   applyPose(pose);
   playerRig.update(0, { direct: true });
@@ -262,6 +280,8 @@ function drawDebugHands(result) {
 }
 
 function clearShatterShake() {
+  rescueShake = { x: 0, y: 0, remain: 0 };
+  rescueLeap = { y: 0, remain: 0, duration: 0.55 };
   const t = "translate(0px, 0px)";
   if (els.stageStone) els.stageStone.style.transform = t;
   if (els.stage) els.stage.style.transform = t;
@@ -269,24 +289,101 @@ function clearShatterShake() {
   if (els.stageInteraction) els.stageInteraction.style.transform = t;
 }
 
-function applyShatterShake() {
-  if (!shatterEffect?.active) return;
-  const { x, y } = shatterEffect.getShake();
+/** @param {number} [intensity] */
+function triggerRescueShake(intensity = 1) {
+  rescueShake.remain = 0.08;
+  rescueShake.x = (Math.random() - 0.5) * 22 * intensity;
+  rescueShake.y = (Math.random() - 0.5) * 18 * intensity;
+}
+
+/** @param {number} dt 秒 */
+function updateRescueShake(dt) {
+  if (rescueShake.remain <= 0) {
+    rescueShake.x = 0;
+    rescueShake.y = 0;
+    return;
+  }
+  rescueShake.remain -= dt;
+  const k = Math.max(0, rescueShake.remain / 0.08);
+  rescueShake.x *= k;
+  rescueShake.y *= k;
+}
+
+/** @param {number} dt 秒 */
+function updateRescueLeap(dt) {
+  if (rescueLeap.remain <= 0) {
+    rescueLeap.y = 0;
+    return;
+  }
+  rescueLeap.remain -= dt;
+  const p = 1 - rescueLeap.remain / rescueLeap.duration;
+  if (p < 0.35) {
+    rescueLeap.y = -8 * (p / 0.35);
+  } else {
+    rescueLeap.y = -8 * (1 - (p - 0.35) / 0.65);
+  }
+}
+
+function applyStageShake() {
+  let x = 0;
+  let y = 0;
+  if (shatterEffect?.active) {
+    const s = shatterEffect.getShake();
+    x += s.x;
+    y += s.y;
+  }
+  x += rescueShake.x;
+  y += rescueShake.y;
   const t = `translate(${x.toFixed(2)}px, ${y.toFixed(2)}px)`;
+  const puppetT = `translate(${x.toFixed(2)}px, ${(y + rescueLeap.y).toFixed(2)}px)`;
   if (els.stageStone && !els.stageStone.classList.contains("stone-hidden")) {
     els.stageStone.style.transform = t;
   }
   if (els.stage) els.stage.style.transform = t;
-  if (els.puppetMountPlayer) els.puppetMountPlayer.style.transform = t;
+  if (els.puppetMountPlayer) els.puppetMountPlayer.style.transform = puppetT;
   if (els.stageInteraction) els.stageInteraction.style.transform = t;
+}
+
+function applyShatterShake() {
+  applyStageShake();
+}
+
+function onRescueFlash() {
+  els.stage?.classList.add("stage-impact-pulse");
+  window.setTimeout(() => {
+    els.stage?.classList.remove("stage-impact-pulse");
+  }, 550);
+}
+
+function onRescueCharStamp(i) {
+  if (i === 0) rescueSuccessAudio?.playOpening();
+  rescueSuccessAudio?.playDrum(i);
+  triggerRescueShake(i === 3 ? 1.35 : 1);
+}
+
+function onRescueClimax() {
+  rescueLeap.y = 0;
+  rescueLeap.remain = rescueLeap.duration;
+  els.puppetMountPlayer?.classList.add("puppet-rescue-triumph");
+  els.stage?.classList.add("stage-success-ambient", "stage-success-ambient-pulse");
+  window.setTimeout(() => {
+    els.stage?.classList.remove("stage-success-ambient-pulse");
+  }, 1800);
+  window.setTimeout(() => {
+    els.puppetMountPlayer?.classList.remove("puppet-rescue-triumph");
+  }, 1400);
 }
 
 function enterFreePhase() {
   experiencePhase = "free";
   bindingPhase?.markDone();
+  stoneShatterAudio?.stop();
+  shakePromptAudioActive = false;
+  unlockPuppetRootPosition();
   clearShatterShake();
   revealStageBackground();
   hideStoneLayer();
+  rescueSuccess?.enterAmbient();
   if (els.bindingHint) {
     els.bindingHint.hidden = true;
     els.bindingHint.classList.remove("pulse-hint");
@@ -297,13 +394,14 @@ function enterFreePhase() {
   }
   simAccum = 0;
   handDetector?.reset();
-  if (!bgm) bgm = new BgmPlayer();
-  bgm.scheduleStart(1500);
 }
 
 function revealStageBackground() {
   els.stage?.classList.remove("stage-hidden");
-  els.stage?.classList.add("stage-visible");
+  els.stage?.classList.add("stage-visible", "stage-forest-bloom");
+  requestAnimationFrame(() => {
+    els.stage?.classList.add("stage-forest-bloom-done");
+  });
 }
 
 function hideStoneLayer() {
@@ -318,6 +416,7 @@ function hideStoneLayer() {
 function beginShatterPuppetControl() {
   if (!fingerCtrl || !playerRig) return;
   fingerCtrl.setBindingPhaseControl(null);
+  fingerCtrl.setRootPositionLocked(true);
   simAccum = 0;
   fingerCtrl.root = {
     x: playerRig.rootExtra.x,
@@ -328,6 +427,10 @@ function beginShatterPuppetControl() {
     const deg = playerRig.displayRotations[name];
     if (deg != null) limb.angle = deg;
   }
+}
+
+function unlockPuppetRootPosition() {
+  fingerCtrl?.setRootPositionLocked(false);
 }
 
 function startShatter() {
@@ -346,6 +449,8 @@ function startShatter() {
     els.bindingHint.hidden = true;
   }
 
+  stoneShatterAudio?.beginShatter();
+
   const center = stoneSlab.getPuppetCenter(rect.width, rect.height);
 
   shatterEffect.start(
@@ -356,8 +461,10 @@ function startShatter() {
     stoneSlab.canvas,
     {
       onImpact: () => {
+        unlockPuppetRootPosition();
         revealStageBackground();
         stoneSlab.hideSlab();
+        rescueSuccess?.triggerAtImpact();
       },
     }
   );
@@ -370,6 +477,10 @@ function initBindingPhase() {
   stoneSlab.resize();
   shatterEffect = new ShatterEffect(els.shatterCanvas, enterFreePhase);
   shatterStarted = false;
+  shakePromptAudioActive = false;
+  stoneShatterAudio?.stop();
+  rescueSuccessAudio?.stop();
+  rescueSuccess?.reset();
 
   bindingPhase = new BindingPhase({
     getGrooveBounds: (w, h) => stoneSlab.getGrooveBounds(w, h),
@@ -377,9 +488,18 @@ function initBindingPhase() {
     onRestoreParts: (parts) => playerRig?.restorePartColor(parts),
     onRevertParts: (parts) => playerRig?.revertPartsToDust(parts),
     onShatterStart: startShatter,
+    onLineBound: (index) => bindingLineAudio?.playLine(index),
   });
 
   experiencePhase = "binding";
+  els.stage?.classList.remove(
+    "stage-success-ambient",
+    "stage-success-ambient-pulse",
+    "stage-forest-bloom",
+    "stage-forest-bloom-done",
+    "stage-impact-pulse"
+  );
+  els.puppetMountPlayer?.classList.remove("puppet-rescue-triumph");
   els.stage?.classList.add("stage-hidden");
   els.stage?.classList.remove("stage-visible");
   els.stageStone.classList.remove("stone-hidden");
@@ -390,6 +510,7 @@ function initBindingPhase() {
 
   playerRig?.enableDustMode();
   applyBindingSpawn();
+  fingerCtrl?.setRootPositionLocked(true);
 
   stoneSlab.ready().then(() => {
     stoneSlab?.resize();
@@ -421,6 +542,7 @@ function loopBinding(ts, frameDt) {
 
   if (shatterActive && fingerCtrl) {
     fingerCtrl.setBindingPhaseControl(null);
+    fingerCtrl.setRootPositionLocked(!shatterEffect.impactFired);
     if (handTick?.fresh) {
       fingerCtrl.updateFromHand(handResult, layoutCache);
       if (DEBUG) drawDebugHands(handResult);
@@ -453,11 +575,11 @@ function loopBinding(ts, frameDt) {
       phase.boundIds.size > 0;
 
     if (partialReady && fingerCtrl) {
-      if (phase.state === "shakePrompt") {
-        fingerCtrl.setBindingPhaseControl(null);
-      } else {
-        fingerCtrl.setBindingPhaseControl(phase.boundIds, true);
-      }
+      fingerCtrl.setBindingPhaseControl(
+        phase.state === "shakePrompt" ? null : phase.boundIds,
+        phase.state !== "shakePrompt"
+      );
+      fingerCtrl.setRootPositionLocked(true);
 
       if (handTick?.fresh) {
         fingerCtrl.updateFromHand(handResult, layoutCache);
@@ -482,6 +604,10 @@ function loopBinding(ts, frameDt) {
       bindingPartialActive = true;
     } else {
       fingerCtrl?.setBindingPhaseControl(null);
+      const stoneIntact =
+        experiencePhase === "binding" &&
+        (!shatterEffect || !shatterEffect.impactFired);
+      fingerCtrl?.setRootPositionLocked(stoneIntact);
       if (bindingPartialActive) {
         applyBindingSpawn();
         bindingPartialActive = false;
@@ -507,6 +633,31 @@ function loopBinding(ts, frameDt) {
     els.bindingHint.classList.toggle("pulse-hint", phase.pulseShake);
   }
 
+  if (phase.state === "shakePrompt") {
+    const handShaking =
+      phase.shakeIntensity >= SHAKE_AUDIO_START_PX || phase.shakeSustain > 0.015;
+    if (handShaking) {
+      if (!shakePromptAudioActive) {
+        stoneShatterAudio?.beginShakePrompt();
+        shakePromptAudioActive = true;
+      }
+      stoneShatterAudio?.updateShakePrompt(
+        phase.shakeIntensity,
+        phase.shakeSustain,
+        frameDt
+      );
+    } else if (shakePromptAudioActive) {
+      stoneShatterAudio?.updateShakePrompt(0, 0, frameDt);
+    }
+  } else if (
+    shakePromptAudioActive &&
+    phase.state !== "shattering" &&
+    !shatterEffect?.active
+  ) {
+    stoneShatterAudio?.stop();
+    shakePromptAudioActive = false;
+  }
+
   if (stoneSlab && phase.state !== "shattering" && !shatterActive) {
     stoneSlab.draw({
       glowEdge: phase.glowEdge,
@@ -518,6 +669,7 @@ function loopBinding(ts, frameDt) {
 
   if (shatterActive) {
     shatterEffect.update(frameDt);
+    stoneShatterAudio?.updateShatter(shatterEffect.elapsed, frameDt);
     shatterEffect.draw();
     applyShatterShake();
   }
@@ -616,10 +768,18 @@ function loop(ts) {
 
   if (experiencePhase === "binding") {
     loopBinding(ts, frameDt);
-    return;
+  } else {
+    loopFree(ts, frameDt);
   }
 
-  loopFree(ts, frameDt);
+  if (rescueSuccess?.state === "active") {
+    updateRescueShake(frameDt);
+    updateRescueLeap(frameDt);
+    rescueSuccess.update(frameDt);
+    applyStageShake();
+  } else if (shatterEffect?.active) {
+    applyStageShake();
+  }
 }
 
 async function initPuppet() {
@@ -648,6 +808,13 @@ async function startExperience() {
   els.startBtn.disabled = true;
   els.startBtn.textContent = "正在加载…";
 
+  bindingLineAudio = new BindingLineAudio();
+  bindingLineAudio.unlock();
+  stoneShatterAudio = new StoneShatterAudio();
+  stoneShatterAudio.unlock();
+  rescueSuccessAudio = new RescueSuccessAudio();
+  rescueSuccessAudio.unlock();
+
   try {
     const stream = await acquireCameraStream();
     cameraStream = stream;
@@ -668,11 +835,14 @@ async function startExperience() {
     stringLines.resize();
 
     await initPuppet();
+    rescueSuccess = new RescueSuccessOverlay(els.rescueSuccess, els.stage, {
+      onFlash: onRescueFlash,
+      onCharStamp: onRescueCharStamp,
+      onClimax: onRescueClimax,
+    });
     initBindingPhase();
 
     els.startOverlay.classList.add("hidden");
-
-    if (!bgm) bgm = new BgmPlayer();
 
     running = true;
     lastTs = 0;
@@ -697,7 +867,6 @@ els.startBtn?.addEventListener("click", startExperience);
 window.addEventListener("pagehide", () => {
   running = false;
   cancelAnimationFrame(animId);
-  bgm?.stop();
   stopCamera();
 });
 

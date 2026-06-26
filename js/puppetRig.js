@@ -453,6 +453,7 @@ export class PuppetRig {
     for (const name of partNames) {
       const entry = this.partEls.get(name);
       if (!entry) continue;
+      if (!entry.el.classList.contains("part-dusty")) continue;
       entry.el.classList.remove("part-dusty");
       entry.el.classList.add("part-dust-clearing");
       entry.el.addEventListener(
